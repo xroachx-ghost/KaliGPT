@@ -36,6 +36,19 @@ except ImportError:  # pragma: no cover - handled in UI
     anthropic = None
 
 
+APP_NAME = "KaliGPT Workstation"
+APP_VERSION = "0.1.0"
+UPDATE_MANIFEST_FILENAME = "packaging/version.json"
+
+
+@dataclass
+class UpdateInfo:
+    latest_version: str
+    notes_url: Optional[str] = None
+    download_url: Optional[str] = None
+    error: Optional[str] = None
+
+
 PROVIDER_REGISTRY = {
     "openai": {
         "label": "OpenAI",
@@ -1333,6 +1346,69 @@ class FirstRunWizard(QtWidgets.QWizard):
         status_label.setText("Looks good")
         status_label.setStyleSheet("color: #6ee7b7; font-size: 11px;")
 
+
+class UpdateChecker(QtCore.QObject):
+    update_ready = QtCore.Signal(UpdateInfo)
+
+    def __init__(
+        self,
+        manifest_url: str,
+        current_version: str,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._manifest_url = manifest_url
+        self._current_version = current_version
+
+    def start(self) -> None:
+        thread = threading.Thread(target=self._run, daemon=True)
+        thread.start()
+
+    def _run(self) -> None:
+        if not self._manifest_url:
+            self.update_ready.emit(
+                UpdateInfo(
+                    latest_version=self._current_version,
+                    error="Update endpoint not configured.",
+                )
+            )
+            return
+        try:
+            payload = self._read_manifest()
+            latest = str(payload.get("version", "")).strip()
+            if not latest:
+                raise ValueError("Update manifest missing version.")
+            notes_url = payload.get("notes_url")
+            download_url = payload.get("download_url")
+            self.update_ready.emit(
+                UpdateInfo(
+                    latest_version=latest,
+                    notes_url=str(notes_url).strip() if notes_url else None,
+                    download_url=str(download_url).strip() if download_url else None,
+                )
+            )
+        except Exception as exc:
+            self.update_ready.emit(
+                UpdateInfo(
+                    latest_version=self._current_version,
+                    error=str(exc),
+                )
+            )
+
+    def _read_manifest(self) -> dict[str, object]:
+        if self._manifest_url.startswith(("http://", "https://")):
+            from urllib.request import Request, urlopen
+
+            req = Request(self._manifest_url, headers={"User-Agent": "KaliGPT-Updater"})
+            with urlopen(req, timeout=5) as handle:  # nosec - controlled URL
+                data = handle.read()
+            return json.loads(data.decode("utf-8"))
+        if self._manifest_url.startswith("file://"):
+            path = QtCore.QUrl(self._manifest_url).toLocalFile()
+        else:
+            path = self._manifest_url
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
 class ChatWindow(QtWidgets.QWidget):
     DEFAULT_PREFERENCES = {
         "persona": "General assistant",
@@ -1369,7 +1445,7 @@ class ChatWindow(QtWidgets.QWidget):
     def __init__(self, mode: str) -> None:
         super().__init__()
         self.mode = mode
-        self.setWindowTitle("KaliGPT Workstation")
+        self.setWindowTitle(APP_NAME)
         self.resize(1200, 720)
 
         self._memory = self._load_memory()
@@ -1386,6 +1462,12 @@ class ChatWindow(QtWidgets.QWidget):
         self._routines: list[Routine] = []
         self._recording_actions: list[RoutineAction] = []
         self._recording_active = False
+        self._update_checker: Optional[UpdateChecker] = None
+        self._update_check_in_progress = False
+        self._update_checks_enabled = True
+        self._agent_is_paused = False
+        self._tray_icon: Optional[QtWidgets.QSystemTrayIcon] = None
+        self._tray_pause_action: Optional[QtGui.QAction] = None
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -1426,6 +1508,19 @@ class ChatWindow(QtWidgets.QWidget):
         self.import_markdown_action.triggered.connect(self._import_conversation_markdown)
         self.export_json_action.triggered.connect(self._export_conversation_json)
         self.export_markdown_action.triggered.connect(self._export_conversation_markdown)
+
+        help_menu = self.menu_bar.addMenu("Help")
+        self.check_updates_action = QtGui.QAction("Check for Updates", self)
+        self.check_updates_action.triggered.connect(self._run_update_check)
+        self.update_checks_enabled_action = QtGui.QAction(
+            "Enable Update Checks", self
+        )
+        self.update_checks_enabled_action.setCheckable(True)
+        self.update_checks_enabled_action.toggled.connect(
+            self._persist_update_check_preference
+        )
+        help_menu.addAction(self.check_updates_action)
+        help_menu.addAction(self.update_checks_enabled_action)
 
         self.conversation_label = QtWidgets.QLabel("Conversation")
         self.conversation_selector = QtWidgets.QComboBox()
@@ -1579,12 +1674,16 @@ class ChatWindow(QtWidgets.QWidget):
         self.preferences_label = QtWidgets.QLabel()
         self.preferences_label.setObjectName("HeaderPreferences")
         self._update_preferences_label()
+        self.update_status_label = QtWidgets.QLabel()
+        self.update_status_label.setObjectName("UpdateStatusLabel")
+        self.update_status_label.setOpenExternalLinks(True)
 
         header_layout = QtWidgets.QVBoxLayout()
         header_layout.addWidget(header_title)
         header_layout.addWidget(self.demo_mode_banner)
         header_layout.addWidget(header_subtitle)
         header_layout.addWidget(self.preferences_label)
+        header_layout.addWidget(self.update_status_label)
         header_layout.setSpacing(2)
 
         header_widget = QtWidgets.QWidget()
@@ -1682,8 +1781,11 @@ class ChatWindow(QtWidgets.QWidget):
         self._monitor_timer.timeout.connect(self._refresh_monitoring)
         self._monitor_timer.start()
         self._refresh_monitoring()
+        self._load_update_check_preference()
         self._update_api_status()
         self._maybe_show_first_run_wizard()
+        self._setup_tray_icon()
+        self._run_update_check()
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -1745,6 +1847,10 @@ class ChatWindow(QtWidgets.QWidget):
                 font-size: 13px;
             }
             QLabel#HeaderPreferences {
+                color: #9aa0a6;
+                font-size: 12px;
+            }
+            QLabel#UpdateStatusLabel {
                 color: #9aa0a6;
                 font-size: 12px;
             }
@@ -3000,6 +3106,85 @@ class ChatWindow(QtWidgets.QWidget):
     def _update_preferences_label(self) -> None:
         self.preferences_label.setText(self._summarize_preferences())
 
+    def _resource_path(self, relative_path: str) -> Path:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+        return (base / relative_path).resolve()
+
+    def _default_update_manifest_url(self) -> str:
+        manifest_path = self._resource_path(UPDATE_MANIFEST_FILENAME)
+        if manifest_path.exists():
+            return manifest_path.as_uri()
+        return ""
+
+    def _load_update_check_preference(self) -> None:
+        preferences = self._memory.get("preferences", {})
+        enabled = True
+        if isinstance(preferences, dict):
+            enabled = bool(preferences.get("update_checks_enabled", True))
+        self._update_checks_enabled = enabled
+        self.update_checks_enabled_action.blockSignals(True)
+        self.update_checks_enabled_action.setChecked(enabled)
+        self.update_checks_enabled_action.blockSignals(False)
+        self.check_updates_action.setEnabled(enabled)
+        if not enabled:
+            self.update_status_label.setText("Update checks disabled.")
+
+    def _persist_update_check_preference(self, enabled: bool) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["update_checks_enabled"] = enabled
+        self._save_memory()
+        self._update_checks_enabled = enabled
+        self.check_updates_action.setEnabled(enabled)
+        if enabled:
+            self._run_update_check()
+        else:
+            self.update_status_label.setText("Update checks disabled.")
+
+    def _run_update_check(self) -> None:
+        if self._update_check_in_progress or not self._update_checks_enabled:
+            return
+        self._update_check_in_progress = True
+        self.update_status_label.setText("Checking for updates...")
+        manifest_url = os.getenv("KALIGPT_UPDATE_URL") or self._default_update_manifest_url()
+        self._update_checker = UpdateChecker(manifest_url, APP_VERSION, self)
+        self._update_checker.update_ready.connect(self._handle_update_result)
+        self._update_checker.start()
+
+    def _handle_update_result(self, info: UpdateInfo) -> None:
+        self._update_check_in_progress = False
+        if info.error:
+            self.update_status_label.setText(f"Update check failed: {info.error}")
+            return
+        if self._is_update_available(APP_VERSION, info.latest_version):
+            url = info.download_url or info.notes_url
+            if url:
+                self.update_status_label.setText(
+                    f"<a href='{url}'>Update available: v{info.latest_version}</a>"
+                )
+            else:
+                self.update_status_label.setText(
+                    f"Update available: v{info.latest_version}"
+                )
+            return
+        self.update_status_label.setText(f"Up to date (v{APP_VERSION}).")
+
+    def _is_update_available(self, current: str, latest: str) -> bool:
+        def to_parts(value: str) -> list[int]:
+            parts = []
+            for chunk in value.split("."):
+                if chunk.isdigit():
+                    parts.append(int(chunk))
+            return parts
+
+        current_parts = to_parts(current)
+        latest_parts = to_parts(latest)
+        if current_parts and latest_parts:
+            return latest_parts > current_parts
+        return current.strip() != latest.strip()
+
     def _behavior_preferences(self) -> dict[str, object]:
         preferences = self._memory.get("preferences", {})
         if not isinstance(preferences, dict):
@@ -3334,10 +3519,17 @@ class ChatWindow(QtWidgets.QWidget):
     def _toggle_agent_loop(self, running: bool) -> None:
         if running:
             self.agent_toggle_button.setText("Stop Agent Loop")
-            QtCore.QMetaObject.invokeMethod(
-                self._agent_runner, "start", QtCore.Qt.QueuedConnection
-            )
+            if self._agent_is_paused:
+                self._agent_is_paused = False
+                QtCore.QMetaObject.invokeMethod(
+                    self._agent_runner, "resume", QtCore.Qt.QueuedConnection
+                )
+            else:
+                QtCore.QMetaObject.invokeMethod(
+                    self._agent_runner, "start", QtCore.Qt.QueuedConnection
+                )
         else:
+            self._agent_is_paused = False
             self.agent_toggle_button.setText("Start Agent Loop")
             QtCore.QMetaObject.invokeMethod(
                 self._agent_runner, "cancel", QtCore.Qt.QueuedConnection
@@ -3345,22 +3537,96 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _handle_agent_state(self, state: str) -> None:
         if state == AgentState.COMPLETED.value:
+            self._agent_is_paused = False
             self.agent_toggle_button.blockSignals(True)
             self.agent_toggle_button.setChecked(False)
             self.agent_toggle_button.blockSignals(False)
             self.agent_toggle_button.setText("Start Agent Loop")
         elif state == AgentState.PAUSED.value:
-            self.agent_toggle_button.setText("Start Agent Loop")
+            self.agent_toggle_button.blockSignals(True)
+            self.agent_toggle_button.setChecked(False)
+            self.agent_toggle_button.blockSignals(False)
+            label = "Resume Agent Loop" if self._agent_is_paused else "Start Agent Loop"
+            self.agent_toggle_button.setText(label)
         elif state == AgentState.ERROR.value:
             self.agent_toggle_button.setText("Stop Agent Loop (recovering)")
         elif state == AgentState.RUNNING.value:
+            self.agent_toggle_button.blockSignals(True)
+            self.agent_toggle_button.setChecked(True)
+            self.agent_toggle_button.blockSignals(False)
             self.agent_toggle_button.setText("Stop Agent Loop")
+        self._sync_tray_pause_state(state)
+
+    def _setup_tray_icon(self) -> None:
+        if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+        tray_icon = QtWidgets.QSystemTrayIcon(icon, self)
+        tray_icon.setToolTip(APP_NAME)
+        menu = QtWidgets.QMenu()
+        open_action = QtGui.QAction("Open", self)
+        open_action.triggered.connect(self._show_from_tray)
+        self._tray_pause_action = QtGui.QAction("Pause agent", self)
+        self._tray_pause_action.setCheckable(True)
+        self._tray_pause_action.toggled.connect(self._toggle_tray_pause)
+        self._tray_pause_action.setEnabled(self.mode == "agent")
+        quit_action = QtGui.QAction("Quit", self)
+        quit_action.triggered.connect(QtWidgets.QApplication.quit)
+        menu.addAction(open_action)
+        menu.addAction(self._tray_pause_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        tray_icon.setContextMenu(menu)
+        tray_icon.show()
+        self._tray_icon = tray_icon
+
+    def _show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _toggle_tray_pause(self, paused: bool) -> None:
+        if self.mode != "agent":
+            return
+        self._agent_is_paused = paused
+        if paused:
+            QtCore.QMetaObject.invokeMethod(
+                self._agent_runner, "pause", QtCore.Qt.QueuedConnection
+            )
+            self.controls_panel.log("Agent loop paused from tray.")
+        else:
+            QtCore.QMetaObject.invokeMethod(
+                self._agent_runner, "resume", QtCore.Qt.QueuedConnection
+            )
+            self.controls_panel.log("Agent loop resumed from tray.")
+
+    def _sync_tray_pause_state(self, state: str) -> None:
+        if not self._tray_pause_action:
+            return
+        if state == AgentState.RUNNING.value:
+            self._tray_pause_action.setEnabled(True)
+            self._tray_pause_action.blockSignals(True)
+            self._tray_pause_action.setChecked(False)
+            self._tray_pause_action.blockSignals(False)
+        elif state == AgentState.PAUSED.value:
+            enabled = self._agent_is_paused
+            self._tray_pause_action.setEnabled(enabled)
+            self._tray_pause_action.blockSignals(True)
+            self._tray_pause_action.setChecked(self._agent_is_paused)
+            self._tray_pause_action.blockSignals(False)
+        else:
+            self._tray_pause_action.setEnabled(False)
+            self._tray_pause_action.blockSignals(True)
+            self._tray_pause_action.setChecked(False)
+            self._tray_pause_action.blockSignals(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._save_conversation_messages()
         self._save_conversation_index()
         self._save_tasks()
         self._save_memory()
+        if self._tray_icon:
+            self._tray_icon.hide()
         QtCore.QMetaObject.invokeMethod(
             self._agent_runner, "cancel", QtCore.Qt.BlockingQueuedConnection
         )

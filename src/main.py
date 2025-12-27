@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -45,6 +47,132 @@ class Task:
     def from_payload(cls, payload: dict[str, object]) -> "Task":
         title = str(payload.get("title", "")).strip()
         return cls(title=title, completed=bool(payload.get("completed", False)))
+
+
+class AgentState(str, Enum):
+    RUNNING = "Running"
+    PAUSED = "Paused"
+    ERROR = "Error"
+    COMPLETED = "Completed"
+
+
+class AgentRunner(QtCore.QObject):
+    state_changed = QtCore.Signal(str)
+    log_message = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        task_provider: Callable[[], list[Task]],
+        interval_ms: int = 2500,
+        max_retries: int = 3,
+        parent: Optional[QtCore.QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._task_provider = task_provider
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._execute_step)
+        self._state = AgentState.PAUSED
+        self._cancelled = False
+        self._paused = True
+        self._step_count = 0
+        self._retry_count = 0
+        self._max_retries = max_retries
+        self._retry_delay_ms = 1200
+
+    @QtCore.Slot()
+    def start(self) -> None:
+        if self._state == AgentState.RUNNING:
+            return
+        self._cancelled = False
+        self._paused = False
+        self._retry_count = 0
+        self._step_count = 0
+        self._set_state(AgentState.RUNNING)
+        self.log_message.emit("Agent loop started.")
+        if not self._timer.isActive():
+            self._timer.start()
+        QtCore.QTimer.singleShot(0, self._execute_step)
+
+    @QtCore.Slot()
+    def pause(self) -> None:
+        if self._paused or self._state == AgentState.COMPLETED:
+            return
+        self._paused = True
+        self._timer.stop()
+        self._set_state(AgentState.PAUSED)
+        self.log_message.emit("Agent loop paused.")
+
+    @QtCore.Slot()
+    def resume(self) -> None:
+        if not self._paused or self._state == AgentState.COMPLETED:
+            return
+        self._paused = False
+        self._set_state(AgentState.RUNNING)
+        self.log_message.emit("Agent loop resumed.")
+        if not self._timer.isActive():
+            self._timer.start()
+
+    @QtCore.Slot()
+    def cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        self._paused = True
+        self._timer.stop()
+        self._set_state(AgentState.PAUSED)
+        self.log_message.emit("Agent loop cancelled by user.")
+
+    def _set_state(self, state: AgentState) -> None:
+        if self._state == state:
+            return
+        self._state = state
+        self.state_changed.emit(state.value)
+
+    def _execute_step(self) -> None:
+        if self._cancelled or self._paused:
+            return
+        try:
+            tasks = self._task_provider()
+            pending = [task for task in tasks if not task.completed]
+            if not pending:
+                self._timer.stop()
+                self._set_state(AgentState.COMPLETED)
+                self.log_message.emit("All tasks completed. Agent loop finished.")
+                return
+            self._step_count += 1
+            self._run_step(pending[0])
+            self._retry_count = 0
+        except Exception as exc:
+            self._handle_step_error(exc)
+
+    def _run_step(self, task: Task) -> None:
+        self.log_message.emit(
+            f"Agent step {self._step_count}: focusing on '{task.title}'."
+        )
+
+    def _handle_step_error(self, exc: Exception) -> None:
+        self._retry_count += 1
+        self._timer.stop()
+        self._set_state(AgentState.ERROR)
+        self.log_message.emit(f"Agent error: {exc}")
+        if self._retry_count <= self._max_retries:
+            self.log_message.emit(
+                f"Attempting recovery ({self._retry_count}/{self._max_retries})..."
+            )
+            QtCore.QTimer.singleShot(self._retry_delay_ms, self._recover_from_error)
+            return
+        self.log_message.emit("Recovery attempts exceeded. Continuing with next step.")
+        self._retry_count = 0
+        QtCore.QTimer.singleShot(self._retry_delay_ms, self._recover_from_error)
+
+    def _recover_from_error(self) -> None:
+        if self._cancelled or self._paused:
+            return
+        self._set_state(AgentState.RUNNING)
+        if not self._timer.isActive():
+            self._timer.start()
+        self._execute_step()
 
 
 class ChatModel(QtCore.QAbstractListModel):
@@ -496,6 +624,9 @@ class ChatWindow(QtWidgets.QWidget):
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
         self.task_model.tasks_changed.connect(self._save_tasks)
+        self._task_snapshot_lock = threading.Lock()
+        self._task_snapshot: list[Task] = []
+        self.task_model.tasks_changed.connect(self._refresh_task_snapshot)
         self.chat_view = QtWidgets.QListView()
         self.chat_view.setModel(self.chat_model)
         self.chat_view.setWordWrap(True)
@@ -542,11 +673,12 @@ class ChatWindow(QtWidgets.QWidget):
         self.agent_toggle_button = QtWidgets.QPushButton("Start Agent Loop")
         self.agent_toggle_button.setCheckable(True)
         self.agent_toggle_button.toggled.connect(self._toggle_agent_loop)
-
-        self.agent_timer = QtCore.QTimer(self)
-        self.agent_timer.setInterval(2500)
-        self.agent_timer.timeout.connect(self._run_agent_step)
-        self._agent_step_count = 0
+        self._agent_thread = QtCore.QThread(self)
+        self._agent_runner = AgentRunner(self._get_task_snapshot)
+        self._agent_runner.moveToThread(self._agent_thread)
+        self._agent_runner.log_message.connect(self.controls_panel.log)
+        self._agent_runner.state_changed.connect(self._handle_agent_state)
+        self._agent_thread.start()
 
         self.api_status = QtWidgets.QLabel()
         self.api_status.setText(self._api_status_text())
@@ -604,6 +736,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._configure_mode()
         self._load_history()
         self._load_tasks()
+        self._refresh_task_snapshot()
         self._refresh_task_controls()
         self.task_view.selectionModel().selectionChanged.connect(
             lambda *_: self._refresh_task_controls()
@@ -763,6 +896,14 @@ class ChatWindow(QtWidgets.QWidget):
         with tasks_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
 
+    def _refresh_task_snapshot(self) -> None:
+        with self._task_snapshot_lock:
+            self._task_snapshot = self.task_model.tasks()
+
+    def _get_task_snapshot(self) -> list[Task]:
+        with self._task_snapshot_lock:
+            return list(self._task_snapshot)
+
     def _selected_task_row(self) -> int | None:
         selection = self.task_view.selectionModel()
         if selection is None:
@@ -829,31 +970,37 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _toggle_agent_loop(self, running: bool) -> None:
         if running:
-            self._agent_step_count = 0
             self.agent_toggle_button.setText("Stop Agent Loop")
-            self.agent_timer.start()
-            self.controls_panel.log("Agent loop started.")
+            QtCore.QMetaObject.invokeMethod(
+                self._agent_runner, "start", QtCore.Qt.QueuedConnection
+            )
         else:
             self.agent_toggle_button.setText("Start Agent Loop")
-            self.agent_timer.stop()
-            self.controls_panel.log("Agent loop stopped.")
+            QtCore.QMetaObject.invokeMethod(
+                self._agent_runner, "cancel", QtCore.Qt.QueuedConnection
+            )
 
-    def _run_agent_step(self) -> None:
-        tasks = self.task_model.tasks()
-        pending = [task for task in tasks if not task.completed]
-        self._agent_step_count += 1
-        if not pending:
-            self.controls_panel.log("Agent loop idle: no pending tasks.")
+    def _handle_agent_state(self, state: str) -> None:
+        if state == AgentState.COMPLETED.value:
+            self.agent_toggle_button.blockSignals(True)
             self.agent_toggle_button.setChecked(False)
-            return
-        current_task = pending[0]
-        self.controls_panel.log(
-            f"Agent step {self._agent_step_count}: focusing on '{current_task.title}'."
-        )
+            self.agent_toggle_button.blockSignals(False)
+            self.agent_toggle_button.setText("Start Agent Loop")
+        elif state == AgentState.PAUSED.value:
+            self.agent_toggle_button.setText("Start Agent Loop")
+        elif state == AgentState.ERROR.value:
+            self.agent_toggle_button.setText("Stop Agent Loop (recovering)")
+        elif state == AgentState.RUNNING.value:
+            self.agent_toggle_button.setText("Stop Agent Loop")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._save_history()
         self._save_tasks()
+        QtCore.QMetaObject.invokeMethod(
+            self._agent_runner, "cancel", QtCore.Qt.BlockingQueuedConnection
+        )
+        self._agent_thread.quit()
+        self._agent_thread.wait()
         super().closeEvent(event)
 
     def handle_send(self) -> None:

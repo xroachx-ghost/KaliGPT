@@ -277,9 +277,12 @@ class AgentRunner(QtCore.QObject):
 
 
 class ChatModel(QtCore.QAbstractListModel):
+    SEARCH_ROLE = QtCore.Qt.UserRole + 1
+
     def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
         self._messages: list[ChatMessage] = []
+        self._search_query = ""
 
     def rowCount(self, parent: QtCore.QModelIndex = QtCore.QModelIndex()) -> int:
         if parent.isValid():
@@ -294,12 +297,29 @@ class ChatModel(QtCore.QAbstractListModel):
             return message.to_display()
         if role == QtCore.Qt.UserRole:
             return message
+        if role == self.SEARCH_ROLE:
+            return self._search_query
         return None
 
     def add_message(self, message: ChatMessage) -> None:
         self.beginInsertRows(QtCore.QModelIndex(), len(self._messages), len(self._messages))
         self._messages.append(message)
         self.endInsertRows()
+
+    def set_messages(self, messages: list[ChatMessage]) -> None:
+        self.beginResetModel()
+        self._messages = list(messages)
+        self.endResetModel()
+
+    def set_search_query(self, query: str) -> None:
+        self._search_query = query
+        if self._messages:
+            top = self.index(0, 0)
+            bottom = self.index(len(self._messages) - 1, 0)
+            self.dataChanged.emit(top, bottom, [self.SEARCH_ROLE])
+
+    def search_query(self) -> str:
+        return self._search_query
 
     def as_openai_messages(self) -> list[dict[str, str]]:
         return [{"role": msg.role, "content": msg.content} for msg in self._messages]
@@ -917,6 +937,10 @@ class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):
         message: ChatMessage | None = index.data(QtCore.Qt.UserRole)
         if message is None:
             return
+        model = index.model()
+        search_query = ""
+        if hasattr(model, "search_query"):
+            search_query = model.search_query()
 
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -953,6 +977,14 @@ class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(bubble_color)
         painter.drawRoundedRect(bubble_rect, 12, 12)
+
+        normalized_query = search_query.strip().lower()
+        if normalized_query and normalized_query in message.content.lower():
+            highlight_pen = QtGui.QPen(QtGui.QColor("#fbbf24"))
+            highlight_pen.setWidth(2)
+            painter.setPen(highlight_pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawRoundedRect(bubble_rect.adjusted(-2, -2, 2, 2), 12, 12)
 
         text_draw_rect = bubble_rect.adjusted(
             self._text_padding, self._text_padding, -self._text_padding, -self._text_padding
@@ -1169,6 +1201,8 @@ class ChatWindow(QtWidgets.QWidget):
         self._provider_health = {
             provider: ProviderHealth() for provider in PROVIDER_REGISTRY
         }
+        self._conversations: list[dict[str, str]] = []
+        self._active_conversation_id: str | None = None
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -1188,6 +1222,37 @@ class ChatWindow(QtWidgets.QWidget):
         self.message_input = QtWidgets.QTextEdit()
         self.message_input.setPlaceholderText("Message KaliGPT...")
         self.message_input.setFixedHeight(100)
+
+        self.menu_bar = QtWidgets.QMenuBar()
+        self.menu_bar.setNativeMenuBar(False)
+        file_menu = self.menu_bar.addMenu("File")
+        self.new_conversation_action = QtGui.QAction("New Conversation", self)
+        self.import_json_action = QtGui.QAction("Import JSON...", self)
+        self.import_markdown_action = QtGui.QAction("Import Markdown...", self)
+        self.export_json_action = QtGui.QAction("Export JSON...", self)
+        self.export_markdown_action = QtGui.QAction("Export Markdown...", self)
+        file_menu.addAction(self.new_conversation_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.import_json_action)
+        file_menu.addAction(self.import_markdown_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.export_json_action)
+        file_menu.addAction(self.export_markdown_action)
+        self.new_conversation_action.triggered.connect(self._prompt_new_conversation)
+        self.import_json_action.triggered.connect(self._import_conversation_json)
+        self.import_markdown_action.triggered.connect(self._import_conversation_markdown)
+        self.export_json_action.triggered.connect(self._export_conversation_json)
+        self.export_markdown_action.triggered.connect(self._export_conversation_markdown)
+
+        self.conversation_label = QtWidgets.QLabel("Conversation")
+        self.conversation_selector = QtWidgets.QComboBox()
+        self.conversation_selector.currentIndexChanged.connect(self._handle_conversation_change)
+        self.new_conversation_button = QtWidgets.QPushButton("New")
+        self.new_conversation_button.clicked.connect(self._prompt_new_conversation)
+
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText("Search conversation...")
+        self.search_input.textChanged.connect(self._handle_search_change)
 
         self.provider_label = QtWidgets.QLabel("Provider")
         self.provider_selector = QtWidgets.QComboBox()
@@ -1320,8 +1385,20 @@ class ChatWindow(QtWidgets.QWidget):
         header_widget = QtWidgets.QWidget()
         header_widget.setLayout(header_layout)
 
+        conversation_layout = QtWidgets.QHBoxLayout()
+        conversation_layout.addWidget(self.conversation_label)
+        conversation_layout.addWidget(self.conversation_selector, stretch=1)
+        conversation_layout.addWidget(self.new_conversation_button)
+
+        search_layout = QtWidgets.QHBoxLayout()
+        search_layout.addWidget(QtWidgets.QLabel("Search"))
+        search_layout.addWidget(self.search_input, stretch=1)
+
         chat_layout = QtWidgets.QVBoxLayout()
+        chat_layout.addWidget(self.menu_bar)
         chat_layout.addWidget(header_widget)
+        chat_layout.addLayout(conversation_layout)
+        chat_layout.addLayout(search_layout)
         chat_layout.addWidget(self.chat_view)
 
         input_layout = QtWidgets.QHBoxLayout()
@@ -1379,7 +1456,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._load_desktop_control_preference()
         self._load_action_review_preference()
         self._load_behavior_preferences()
-        self._load_history()
+        self._load_conversations()
         self._load_tasks()
         self._refresh_task_snapshot()
         self._refresh_task_controls()
@@ -1757,26 +1834,229 @@ class ChatWindow(QtWidgets.QWidget):
         self._persist_model_selection()
         self._update_api_status()
 
-    def _load_history(self) -> None:
-        history_path = self._history_path()
-        if not history_path.exists():
-            return
-        try:
-            with history_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            for item in payload:
-                message = ChatMessage(
-                    role=item["role"],
-                    content=item["content"],
-                    timestamp=datetime.fromisoformat(item["timestamp"]),
-                )
-                self.chat_model.add_message(message)
-        except (OSError, ValueError, KeyError):
-            return
+    def _load_conversations(self) -> None:
+        self._load_conversation_index()
+        self._populate_conversation_selector()
+        if self._active_conversation_id:
+            self._load_conversation_messages(self._active_conversation_id)
 
-    def _save_history(self) -> None:
-        history_path = self._history_path()
-        history_path.parent.mkdir(parents=True, exist_ok=True)
+    def _load_conversation_index(self) -> None:
+        index_path = self._conversation_index_path()
+        self._conversations = []
+        self._active_conversation_id = None
+        if index_path.exists():
+            try:
+                with index_path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                conversations = payload.get("conversations", [])
+                if isinstance(conversations, list):
+                    self._conversations = [
+                        item for item in conversations if isinstance(item, dict) and item.get("id")
+                    ]
+                active_id = payload.get("active_id")
+                if isinstance(active_id, str):
+                    self._active_conversation_id = active_id
+            except (OSError, ValueError, TypeError, AttributeError):
+                self._conversations = []
+                self._active_conversation_id = None
+
+        if not self._conversations:
+            legacy_path = self._history_path()
+            if legacy_path.exists():
+                messages = self._read_messages_from_json(legacy_path)
+                conversation_id = self._create_conversation(
+                    title="Migrated Conversation",
+                    messages=messages,
+                    switch_to=True,
+                )
+                self._active_conversation_id = conversation_id
+            else:
+                conversation_id = self._create_conversation(
+                    title="Conversation 1",
+                    messages=[],
+                    switch_to=True,
+                )
+                self._active_conversation_id = conversation_id
+        elif self._active_conversation_id is None:
+            self._active_conversation_id = self._conversations[0]["id"]
+        else:
+            known_ids = {meta.get("id") for meta in self._conversations}
+            if self._active_conversation_id not in known_ids:
+                self._active_conversation_id = self._conversations[0]["id"]
+
+        self._save_conversation_index()
+
+    def _save_conversation_index(self) -> None:
+        index_path = self._conversation_index_path()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active_id": self._active_conversation_id,
+            "conversations": self._conversations,
+        }
+        with index_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def _populate_conversation_selector(self) -> None:
+        self.conversation_selector.blockSignals(True)
+        self.conversation_selector.clear()
+        active_index = 0
+        for index, meta in enumerate(self._conversations):
+            title = meta.get("title") or "Conversation"
+            conversation_id = meta.get("id", "")
+            self.conversation_selector.addItem(title, conversation_id)
+            if conversation_id == self._active_conversation_id:
+                active_index = index
+        if self.conversation_selector.count():
+            self.conversation_selector.setCurrentIndex(active_index)
+        self.conversation_selector.blockSignals(False)
+
+    def _handle_conversation_change(self, index: int) -> None:
+        if index < 0:
+            return
+        conversation_id = self.conversation_selector.currentData()
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return
+        if conversation_id == self._active_conversation_id:
+            return
+        self._save_conversation_messages()
+        self._active_conversation_id = conversation_id
+        self._save_conversation_index()
+        self._load_conversation_messages(conversation_id)
+
+    def _prompt_new_conversation(self) -> None:
+        title, ok = QtWidgets.QInputDialog.getText(
+            self, "New Conversation", "Conversation title"
+        )
+        if not ok:
+            return
+        title = title.strip() or f"Conversation {len(self._conversations) + 1}"
+        self._create_conversation(title=title, messages=[], switch_to=True)
+
+    def _create_conversation(
+        self,
+        title: str,
+        messages: list[ChatMessage],
+        switch_to: bool = False,
+    ) -> str:
+        conversation_id = self._new_conversation_id()
+        timestamp = datetime.now().isoformat()
+        meta = {
+            "id": conversation_id,
+            "title": title,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        self._conversations.append(meta)
+        self._save_conversation_messages(conversation_id, messages)
+        if switch_to:
+            self._active_conversation_id = conversation_id
+            self._populate_conversation_selector()
+            self._load_conversation_messages(conversation_id)
+        self._save_conversation_index()
+        return conversation_id
+
+    def _load_conversation_messages(self, conversation_id: str) -> None:
+        path = self._conversation_path(conversation_id)
+        messages = []
+        if path.exists():
+            messages = self._read_messages_from_json(path)
+        self.chat_model.set_messages(messages)
+        self.chat_view.scrollToBottom()
+
+    def _save_conversation_messages(
+        self,
+        conversation_id: str | None = None,
+        messages: Optional[list[ChatMessage]] = None,
+    ) -> None:
+        conversation_id = conversation_id or self._active_conversation_id
+        if not conversation_id:
+            return
+        payload = [
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "timestamp": msg.timestamp.isoformat(),
+            }
+            for msg in (messages or self.chat_model._messages)
+        ]
+        path = self._conversation_path(conversation_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        self._touch_conversation(conversation_id)
+
+    def _touch_conversation(self, conversation_id: str) -> None:
+        for meta in self._conversations:
+            if meta.get("id") == conversation_id:
+                meta["updated_at"] = datetime.now().isoformat()
+                break
+        self._save_conversation_index()
+
+    def _new_conversation_id(self) -> str:
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        suffix = random.randint(1000, 9999)
+        return f"conv-{stamp}-{suffix}"
+
+    def _read_messages_from_json(self, path: Path) -> list[ChatMessage]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, list):
+                return []
+            messages = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "assistant"))
+                content = str(item.get("content", ""))
+                timestamp_raw = item.get("timestamp")
+                try:
+                    timestamp = (
+                        datetime.fromisoformat(timestamp_raw)
+                        if isinstance(timestamp_raw, str)
+                        else datetime.now()
+                    )
+                except ValueError:
+                    timestamp = datetime.now()
+                messages.append(ChatMessage(role=role, content=content, timestamp=timestamp))
+            return messages
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _conversation_index_path(self) -> Path:
+        return self._conversations_dir() / "index.json"
+
+    def _conversation_path(self, conversation_id: str) -> Path:
+        return self._conversations_dir() / f"{conversation_id}.json"
+
+    def _conversations_dir(self) -> Path:
+        return Path.home() / ".kaligpt" / "conversations"
+
+    def _history_path(self) -> Path:
+        return Path.home() / ".kaligpt" / "history.json"
+
+    def _handle_search_change(self, text: str) -> None:
+        self.chat_model.set_search_query(text)
+        if text.strip():
+            self.chat_view.viewport().update()
+
+    def _export_conversation_json(self) -> None:
+        conversation = self._active_conversation_meta()
+        if not conversation:
+            return
+        start_dir = str(Path.home())
+        suggested = f"{conversation.get('title', 'conversation')}.json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Conversation (JSON)",
+            str(Path(start_dir) / suggested),
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        if destination.suffix.lower() != ".json":
+            destination = destination.with_suffix(".json")
         payload = [
             {
                 "role": msg.role,
@@ -1785,11 +2065,159 @@ class ChatWindow(QtWidgets.QWidget):
             }
             for msg in self.chat_model._messages
         ]
-        with history_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        try:
+            with destination.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export Conversation",
+                f"Failed to export conversation: {exc}",
+            )
 
-    def _history_path(self) -> Path:
-        return Path.home() / ".kaligpt" / "history.json"
+    def _export_conversation_markdown(self) -> None:
+        conversation = self._active_conversation_meta()
+        if not conversation:
+            return
+        start_dir = str(Path.home())
+        suggested = f"{conversation.get('title', 'conversation')}.md"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Conversation (Markdown)",
+            str(Path(start_dir) / suggested),
+            "Markdown Files (*.md)",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        if destination.suffix.lower() != ".md":
+            destination = destination.with_suffix(".md")
+        try:
+            destination.write_text(self._format_markdown_conversation(), encoding="utf-8")
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export Conversation",
+                f"Failed to export conversation: {exc}",
+            )
+
+    def _import_conversation_json(self) -> None:
+        start_dir = str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import Conversation (JSON)",
+            start_dir,
+            "JSON Files (*.json)",
+        )
+        if not path:
+            return
+        source = Path(path)
+        messages = self._read_messages_from_json(source)
+        if not messages:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Import Conversation",
+                "No valid messages were found in the selected file.",
+            )
+            return
+        title = source.stem.replace("_", " ").title()
+        self._create_conversation(title=title, messages=messages, switch_to=True)
+
+    def _import_conversation_markdown(self) -> None:
+        start_dir = str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import Conversation (Markdown)",
+            start_dir,
+            "Markdown Files (*.md)",
+        )
+        if not path:
+            return
+        source = Path(path)
+        try:
+            markdown_text = source.read_text(encoding="utf-8")
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Import Conversation",
+                f"Failed to read file: {exc}",
+            )
+            return
+        messages = self._parse_markdown_conversation(markdown_text)
+        if not messages:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Import Conversation",
+                "No messages could be parsed from the Markdown file.",
+            )
+            return
+        title = source.stem.replace("_", " ").title()
+        self._create_conversation(title=title, messages=messages, switch_to=True)
+
+    def _format_markdown_conversation(self) -> str:
+        conversation = self._active_conversation_meta() or {}
+        title = conversation.get("title", "Conversation")
+        lines = [f"# {title}", ""]
+        for message in self.chat_model._messages:
+            timestamp = message.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"### {message.role.title()} · {timestamp}")
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
+    def _parse_markdown_conversation(self, markdown_text: str) -> list[ChatMessage]:
+        messages: list[ChatMessage] = []
+        current_role = None
+        current_timestamp = datetime.now()
+        buffer: list[str] = []
+        header_pattern = re.compile(r"^###\s+(.+?)(?:\s+·\s+(.+))?$")
+
+        def flush() -> None:
+            nonlocal buffer, current_role, current_timestamp
+            if current_role and buffer:
+                content = "\n".join(line.rstrip() for line in buffer).strip()
+                if content:
+                    messages.append(
+                        ChatMessage(
+                            role=current_role,
+                            content=content,
+                            timestamp=current_timestamp,
+                        )
+                    )
+            buffer = []
+
+        for line in markdown_text.splitlines():
+            match = header_pattern.match(line.strip())
+            if match:
+                flush()
+                role = match.group(1).strip().lower()
+                if role not in {"user", "assistant", "system"}:
+                    role = "assistant"
+                current_role = role
+                timestamp_text = match.group(2)
+                if timestamp_text:
+                    try:
+                        current_timestamp = datetime.fromisoformat(timestamp_text.strip())
+                    except ValueError:
+                        try:
+                            current_timestamp = datetime.strptime(
+                                timestamp_text.strip(), "%Y-%m-%d %H:%M:%S"
+                            )
+                        except ValueError:
+                            current_timestamp = datetime.now()
+                else:
+                    current_timestamp = datetime.now()
+                continue
+            buffer.append(line)
+        flush()
+        return messages
+
+    def _active_conversation_meta(self) -> Optional[dict[str, str]]:
+        for meta in self._conversations:
+            if meta.get("id") == self._active_conversation_id:
+                return meta
+        return None
 
     def _memory_path(self) -> Path:
         return Path.home() / ".kaligpt" / "memory.json"
@@ -2377,7 +2805,8 @@ class ChatWindow(QtWidgets.QWidget):
             self.agent_toggle_button.setText("Stop Agent Loop")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
-        self._save_history()
+        self._save_conversation_messages()
+        self._save_conversation_index()
         self._save_tasks()
         self._save_memory()
         QtCore.QMetaObject.invokeMethod(
@@ -2400,6 +2829,16 @@ class ChatWindow(QtWidgets.QWidget):
         message = ChatMessage(role=role, content=content, timestamp=datetime.now())
         self.chat_model.add_message(message)
         self.chat_view.scrollToBottom()
+        if role == "user":
+            meta = self._active_conversation_meta()
+            if meta:
+                title = meta.get("title", "")
+                if title.lower().startswith("conversation"):
+                    snippet = content.strip().splitlines()[0][:60]
+                    meta["title"] = snippet or title
+                    self._save_conversation_index()
+                    self._populate_conversation_selector()
+        self._save_conversation_messages()
 
     def _extract_actions(self, response: str) -> list[dict[str, object]]:
         action_blocks: list[dict[str, object]] = []

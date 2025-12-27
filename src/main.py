@@ -1,6 +1,7 @@
 """KaliGPT desktop controller GUI."""
 from __future__ import annotations
 
+import csv
 import importlib
 import json
 import os
@@ -434,6 +435,7 @@ class TaskModel(QtCore.QAbstractTableModel):
 
 class ComputerControlPanel(QtWidgets.QGroupBox):
     screenshot_captured = QtCore.Signal(QtGui.QPixmap)
+    export_audit_requested = QtCore.Signal()
     preview_interval_ms = 1000
     AUTOMATION_UNAVAILABLE_MESSAGE = (
         "Automation unavailable. Install pyautogui and grant OS accessibility permissions "
@@ -468,6 +470,12 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             "Review action batches before execution"
         )
         self.batch_review_toggle.setChecked(True)
+
+        self.permission_scope_panel = QtWidgets.QGroupBox("Permission Scope")
+        self.permission_scope_label = QtWidgets.QLabel()
+        self.permission_scope_label.setWordWrap(True)
+        permission_layout = QtWidgets.QVBoxLayout(self.permission_scope_panel)
+        permission_layout.addWidget(self.permission_scope_label)
 
         self.emergency_stop_button = QtWidgets.QPushButton("Emergency Stop")
         self.emergency_stop_button.setStyleSheet(
@@ -603,11 +611,15 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Automation log will appear here.")
 
+        self.export_audit_button = QtWidgets.QPushButton("Export Audit Log")
+        self.export_audit_button.clicked.connect(self.export_audit_requested.emit)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.status_label)
         layout.addWidget(self.automation_banner)
         layout.addWidget(self.enable_control_toggle)
         layout.addWidget(self.batch_review_toggle)
+        layout.addWidget(self.permission_scope_panel)
         control_row = QtWidgets.QHBoxLayout()
         control_row.addWidget(self.emergency_stop_button)
         control_row.addWidget(self.reset_stop_button)
@@ -618,8 +630,10 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(delay_widget)
         layout.addWidget(self.manual_controls_group)
         layout.addWidget(self.activity_log)
+        layout.addWidget(self.export_audit_button)
         self.screenshot_captured.connect(self.update_preview)
         self._update_automation_availability(log_message=True)
+        self._update_permission_summary()
 
     def set_agent_mode(self, active: bool) -> None:
         self._agent_mode_active = active
@@ -646,12 +660,14 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.enable_control_toggle.setChecked(False)
             self.enable_control_toggle.blockSignals(False)
             self._note_automation_unavailable()
+            self._update_permission_summary()
             return
         if self._emergency_stopped:
             self.enable_control_toggle.blockSignals(True)
             self.enable_control_toggle.setChecked(False)
             self.enable_control_toggle.blockSignals(False)
             self.log("Control toggle ignored: emergency stop is active.")
+            self._update_permission_summary()
             return
         if enabled:
             self.status_label.setText(
@@ -661,6 +677,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         else:
             self.status_label.setText("Control disabled.")
             self.log("Control disabled.")
+        self._update_permission_summary()
 
     def handle_screenshot(self) -> None:
         if pyautogui is None:
@@ -740,6 +757,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             "Emergency stop engaged. Control actions are blocked until reset."
         )
         self.log("Emergency stop activated. All control actions blocked.")
+        self._update_permission_summary()
 
     def handle_reset_stop(self) -> None:
         if not self._emergency_stopped:
@@ -748,6 +766,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.reset_stop_button.setEnabled(False)
         self.status_label.setText("Control disabled.")
         self.log("Emergency stop cleared. Control remains disabled.")
+        self._update_permission_summary()
 
     def _control_allowed(self, action_label: str) -> bool:
         if pyautogui is None:
@@ -790,6 +809,22 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.take_screenshot_button.setToolTip("")
             self.preview_toggle_button.setToolTip("")
             self.manual_controls_group.setToolTip("")
+        self._update_permission_summary()
+
+    def _update_permission_summary(self) -> None:
+        if pyautogui is None:
+            allowed = "none (automation unavailable)"
+        else:
+            allowed = "screenshot, move mouse, click, type, press key"
+        if self._emergency_stopped:
+            status = "blocked (emergency stop)"
+        elif not self.enable_control_toggle.isChecked():
+            status = "disabled"
+        else:
+            status = "enabled"
+        self.permission_scope_label.setText(
+            f"Allowed: {allowed}.\nStatus: {status}."
+        )
 
     def _action_delay_seconds(self) -> float:
         minimum = self.delay_min_spin.value()
@@ -1127,6 +1162,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.resize(1200, 720)
 
         self._memory = self._load_memory()
+        self._audit_log = self._load_audit_log()
         self._first_run = self._needs_first_run_wizard()
         self._suppress_api_prompt = self._first_run
         self._load_api_keys()
@@ -1214,6 +1250,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.controls_panel.batch_review_toggle.toggled.connect(
             self._persist_action_review_preference
         )
+        self.controls_panel.export_audit_requested.connect(self._export_audit_log)
         self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
         self.monitoring_window_label = QtWidgets.QLabel("Active window: Unavailable")
         self.monitoring_process_label = QtWidgets.QLabel("Foreground process: Unavailable")
@@ -1530,6 +1567,12 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _log_monitor_event(self, message: str) -> None:
         self.controls_panel.log(f"Monitoring: {message}")
+        self._append_audit_entry(
+            {
+                "event": "monitoring",
+                "message": message,
+            }
+        )
 
     def _active_window_info(self) -> tuple[str, str]:
         if not sys.platform.startswith("linux"):
@@ -1754,6 +1797,9 @@ class ChatWindow(QtWidgets.QWidget):
     def _tasks_path(self) -> Path:
         return Path.home() / ".kaligpt" / "tasks.json"
 
+    def _audit_log_path(self) -> Path:
+        return Path.home() / ".kaligpt" / "audit.json"
+
     def _load_memory(self) -> dict[str, object]:
         memory_path = self._memory_path()
         if not memory_path.exists():
@@ -1775,6 +1821,83 @@ class ChatWindow(QtWidgets.QWidget):
         memory_path.parent.mkdir(parents=True, exist_ok=True)
         with memory_path.open("w", encoding="utf-8") as handle:
             json.dump(self._memory, handle, indent=2)
+
+    def _export_audit_log(self) -> None:
+        if not self._audit_log:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Audit Log",
+                "No audit entries are available to export yet.",
+            )
+            return
+        start_dir = str(Path.home())
+        path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Audit Log",
+            start_dir,
+            "JSON Files (*.json);;CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        export_csv = destination.suffix.lower() == ".csv" or "CSV" in selected_filter
+        if not destination.suffix:
+            destination = destination.with_suffix(".csv" if export_csv else ".json")
+        try:
+            if export_csv:
+                self._write_audit_csv(destination)
+            else:
+                with destination.open("w", encoding="utf-8") as handle:
+                    json.dump(self._audit_log, handle, indent=2)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export Audit Log",
+                f"Failed to export audit log: {exc}",
+            )
+
+    def _write_audit_csv(self, destination: Path) -> None:
+        fieldnames: list[str] = []
+        for entry in self._audit_log:
+            for key in entry.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with destination.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for entry in self._audit_log:
+                row: dict[str, object] = {}
+                for key in fieldnames:
+                    value = entry.get(key)
+                    if isinstance(value, (dict, list)):
+                        row[key] = json.dumps(value)
+                    else:
+                        row[key] = value
+                writer.writerow(row)
+
+    def _load_audit_log(self) -> list[dict[str, object]]:
+        audit_path = self._audit_log_path()
+        if not audit_path.exists():
+            return []
+        try:
+            with audit_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+        except (OSError, ValueError, TypeError):
+            return []
+        return []
+
+    def _save_audit_log(self) -> None:
+        audit_path = self._audit_log_path()
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("w", encoding="utf-8") as handle:
+            json.dump(self._audit_log, handle, indent=2)
+
+    def _append_audit_entry(self, entry: dict[str, object]) -> None:
+        entry.setdefault("timestamp", datetime.now().isoformat())
+        self._audit_log.append(entry)
+        self._save_audit_log()
 
     def _load_api_keys(self) -> None:
         api_keys = self._memory.get("api_keys", {})
@@ -2130,6 +2253,15 @@ class ChatWindow(QtWidgets.QWidget):
             "summary": summary,
             "timestamp": timestamp,
         }
+        self._append_audit_entry(
+            {
+                "event": "task_outcome",
+                "title": title,
+                "step": step_count,
+                "success": success,
+                "summary": summary,
+            }
+        )
         self._memory.setdefault("task_outcomes", []).append(outcome)
         if not success:
             self._memory.setdefault("failures", []).append(
@@ -2312,9 +2444,26 @@ class ChatWindow(QtWidgets.QWidget):
         if not isinstance(parameters, dict):
             parameters = {}
         summary = self._format_action_summary(action, parameters)
+        self._append_audit_entry(
+            {
+                "event": "control_action_requested",
+                "action": action,
+                "parameters": parameters,
+                "summary": summary,
+                "confirmation_required": confirm,
+            }
+        )
         self.controls_panel.log(f"Action requested: {summary}")
         if not self.controls_panel.isEnabled():
             self.controls_panel.log("Action skipped: control panel is disabled.")
+            self._append_audit_entry(
+                {
+                    "event": "control_action_skipped",
+                    "action": action,
+                    "summary": summary,
+                    "reason": "control panel disabled",
+                }
+            )
             return
         if confirm:
             prompt = f"Execute action?\n\n{summary}"
@@ -2324,8 +2473,25 @@ class ChatWindow(QtWidgets.QWidget):
                 prompt,
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             )
-            if response != QtWidgets.QMessageBox.Yes:
+            approved = response == QtWidgets.QMessageBox.Yes
+            self._append_audit_entry(
+                {
+                    "event": "control_action_confirmation",
+                    "action": action,
+                    "summary": summary,
+                    "approved": approved,
+                }
+            )
+            if not approved:
                 self.controls_panel.log("Action canceled by user.")
+                self._append_audit_entry(
+                    {
+                        "event": "control_action_canceled",
+                        "action": action,
+                        "summary": summary,
+                        "reason": "user declined confirmation",
+                    }
+                )
                 return
         dispatch_map = {
             "move_mouse": self.controls_panel.move_mouse,
@@ -2336,9 +2502,24 @@ class ChatWindow(QtWidgets.QWidget):
         handler = dispatch_map.get(action)
         if handler is None:
             self.controls_panel.log(f"Action ignored: unsupported action '{action}'.")
+            self._append_audit_entry(
+                {
+                    "event": "control_action_unsupported",
+                    "action": action,
+                    "summary": summary,
+                }
+            )
             return
-        handler(**parameters)
+        outcome = handler(**parameters)
         self.controls_panel.log("Action executed.")
+        self._append_audit_entry(
+            {
+                "event": "control_action_executed",
+                "action": action,
+                "summary": summary,
+                "success": bool(outcome),
+            }
+        )
 
     def _review_actions(self, summaries: list[str]) -> list[int]:
         dialog = QtWidgets.QDialog(self)

@@ -464,6 +464,11 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.enable_control_toggle = QtWidgets.QCheckBox("Enable Control")
         self.enable_control_toggle.toggled.connect(self.handle_control_toggle)
 
+        self.batch_review_toggle = QtWidgets.QCheckBox(
+            "Review action batches before execution"
+        )
+        self.batch_review_toggle.setChecked(True)
+
         self.emergency_stop_button = QtWidgets.QPushButton("Emergency Stop")
         self.emergency_stop_button.setStyleSheet(
             "background: #a81818; color: white; font-weight: 700;"
@@ -602,6 +607,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.status_label)
         layout.addWidget(self.automation_banner)
         layout.addWidget(self.enable_control_toggle)
+        layout.addWidget(self.batch_review_toggle)
         control_row = QtWidgets.QHBoxLayout()
         control_row.addWidget(self.emergency_stop_button)
         control_row.addWidget(self.reset_stop_button)
@@ -1205,6 +1211,9 @@ class ChatWindow(QtWidgets.QWidget):
         self.controls_panel.enable_control_toggle.toggled.connect(
             self._persist_desktop_control_preference
         )
+        self.controls_panel.batch_review_toggle.toggled.connect(
+            self._persist_action_review_preference
+        )
         self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
         self.monitoring_window_label = QtWidgets.QLabel("Active window: Unavailable")
         self.monitoring_process_label = QtWidgets.QLabel("Foreground process: Unavailable")
@@ -1331,6 +1340,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._configure_mode()
         self._build_provider_status_widgets()
         self._load_desktop_control_preference()
+        self._load_action_review_preference()
         self._load_behavior_preferences()
         self._load_history()
         self._load_tasks()
@@ -1917,6 +1927,23 @@ class ChatWindow(QtWidgets.QWidget):
         preferences["desktop_control_enabled"] = enabled
         self._save_memory()
 
+    def _load_action_review_preference(self) -> None:
+        preferences = self._memory.get("preferences", {})
+        if not isinstance(preferences, dict):
+            return
+        enabled = bool(preferences.get("batch_action_review_enabled", True))
+        self.controls_panel.batch_review_toggle.blockSignals(True)
+        self.controls_panel.batch_review_toggle.setChecked(enabled)
+        self.controls_panel.batch_review_toggle.blockSignals(False)
+
+    def _persist_action_review_preference(self, enabled: bool) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["batch_action_review_enabled"] = enabled
+        self._save_memory()
+
     def _optional_module(self, module_name: str):
         if importlib.util.find_spec(module_name) is None:
             return None
@@ -2275,7 +2302,9 @@ class ChatWindow(QtWidgets.QWidget):
             return f"Press key: {parameters.get('key')}"
         return f"Unknown action: {action}"
 
-    def _dispatch_action(self, action_payload: dict[str, object]) -> None:
+    def _dispatch_action(
+        self, action_payload: dict[str, object], confirm: bool = True
+    ) -> None:
         action = action_payload.get("action")
         if not isinstance(action, str):
             return
@@ -2287,16 +2316,17 @@ class ChatWindow(QtWidgets.QWidget):
         if not self.controls_panel.isEnabled():
             self.controls_panel.log("Action skipped: control panel is disabled.")
             return
-        prompt = f"Execute action?\n\n{summary}"
-        response = QtWidgets.QMessageBox.question(
-            self,
-            "Confirm Action",
-            prompt,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-        )
-        if response != QtWidgets.QMessageBox.Yes:
-            self.controls_panel.log("Action canceled by user.")
-            return
+        if confirm:
+            prompt = f"Execute action?\n\n{summary}"
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Confirm Action",
+                prompt,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                self.controls_panel.log("Action canceled by user.")
+                return
         dispatch_map = {
             "move_mouse": self.controls_panel.move_mouse,
             "click_mouse": self.controls_panel.click_mouse,
@@ -2310,9 +2340,100 @@ class ChatWindow(QtWidgets.QWidget):
         handler(**parameters)
         self.controls_panel.log("Action executed.")
 
+    def _review_actions(self, summaries: list[str]) -> list[int]:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Review Actions")
+        dialog.setModal(True)
+
+        info_label = QtWidgets.QLabel(
+            "Review planned actions before execution. Uncheck any action to skip."
+        )
+        info_label.setWordWrap(True)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_contents = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_contents)
+        checkboxes: list[QtWidgets.QCheckBox] = []
+        for summary in summaries:
+            checkbox = QtWidgets.QCheckBox(summary)
+            checkbox.setChecked(True)
+            scroll_layout.addWidget(checkbox)
+            checkboxes.append(checkbox)
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_contents)
+
+        approve_all_button = QtWidgets.QPushButton("Approve All")
+        reject_all_button = QtWidgets.QPushButton("Reject All")
+        execute_selected_button = QtWidgets.QPushButton("Execute Selected")
+
+        decision: dict[str, str] = {}
+
+        def set_decision(value: str) -> None:
+            decision["value"] = value
+            dialog.accept()
+
+        approve_all_button.clicked.connect(lambda: set_decision("approve_all"))
+        reject_all_button.clicked.connect(lambda: set_decision("reject_all"))
+        execute_selected_button.clicked.connect(
+            lambda: set_decision("execute_selected")
+        )
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addWidget(approve_all_button)
+        button_row.addWidget(reject_all_button)
+        button_row.addStretch()
+        button_row.addWidget(execute_selected_button)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(info_label)
+        layout.addWidget(scroll_area)
+        layout.addLayout(button_row)
+
+        result = dialog.exec()
+        selection = decision.get("value")
+        if result != QtWidgets.QDialog.Accepted or selection is None:
+            return []
+        if selection == "approve_all":
+            return list(range(len(summaries)))
+        if selection == "execute_selected":
+            return [index for index, checkbox in enumerate(checkboxes) if checkbox.isChecked()]
+        return []
+
     def _dispatch_actions(self, response: str) -> None:
-        for action in self._extract_actions(response):
-            self._dispatch_action(action)
+        actions = self._extract_actions(response)
+        if not actions:
+            return
+        if (
+            len(actions) == 1
+            or not self.controls_panel.batch_review_toggle.isChecked()
+        ):
+            for action in actions:
+                self._dispatch_action(action, confirm=True)
+            return
+        summaries = []
+        for action_payload in actions:
+            action = action_payload.get("action")
+            parameters = action_payload.get("parameters")
+            if not isinstance(action, str):
+                summaries.append("Unknown action: <invalid>")
+                continue
+            summary_parameters = (
+                parameters if isinstance(parameters, dict) else {}
+            )
+            summaries.append(self._format_action_summary(action, summary_parameters))
+        approved_indices = self._review_actions(summaries)
+        approved_set = set(approved_indices)
+        self.controls_panel.log(
+            f"Batch review: approved {len(approved_indices)}/{len(actions)} actions."
+        )
+        for index, summary in enumerate(summaries):
+            if index in approved_set:
+                self.controls_panel.log(f"Action approved: {summary}")
+            else:
+                self.controls_panel.log(f"Action rejected: {summary}")
+        for index in approved_indices:
+            self._dispatch_action(actions[index], confirm=False)
 
     def _call_with_retries(self, provider: str, api_call: Callable[[], str]) -> str:
         max_retries = 3

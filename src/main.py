@@ -6,6 +6,8 @@ import json
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -1010,6 +1012,15 @@ class ChatWindow(QtWidgets.QWidget):
         self.send_button.clicked.connect(self.handle_send)
 
         self.controls_panel = ComputerControlPanel()
+        self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
+        self.monitoring_window_label = QtWidgets.QLabel("Active window: Unavailable")
+        self.monitoring_process_label = QtWidgets.QLabel("Foreground process: Unavailable")
+        self.monitoring_cpu_label = QtWidgets.QLabel("CPU load: Unavailable")
+        self.monitoring_memory_label = QtWidgets.QLabel("Memory usage: Unavailable")
+        self._monitor_last_window: Optional[str] = None
+        self._monitor_last_process: Optional[str] = None
+        self._monitor_last_cpu: Optional[float] = None
+        self._monitor_last_memory: Optional[float] = None
         self.task_panel = QtWidgets.QGroupBox("Tasks")
         self.task_view = QtWidgets.QTableView()
         self.task_view.setModel(self.task_model)
@@ -1101,9 +1112,16 @@ class ChatWindow(QtWidgets.QWidget):
         task_layout.addLayout(task_button_layout)
         task_layout.addWidget(self.agent_toggle_button)
 
+        monitoring_layout = QtWidgets.QVBoxLayout(self.monitoring_panel)
+        monitoring_layout.addWidget(self.monitoring_window_label)
+        monitoring_layout.addWidget(self.monitoring_process_label)
+        monitoring_layout.addWidget(self.monitoring_cpu_label)
+        monitoring_layout.addWidget(self.monitoring_memory_label)
+
         right_layout = QtWidgets.QVBoxLayout()
         right_layout.addWidget(self.task_panel)
         right_layout.addWidget(self.controls_panel)
+        right_layout.addWidget(self.monitoring_panel)
         right_layout.addStretch()
 
         right_widget = QtWidgets.QWidget()
@@ -1123,6 +1141,11 @@ class ChatWindow(QtWidgets.QWidget):
         self.task_view.selectionModel().selectionChanged.connect(
             lambda *_: self._refresh_task_controls()
         )
+        self._monitor_timer = QtCore.QTimer(self)
+        self._monitor_timer.setInterval(2500)
+        self._monitor_timer.timeout.connect(self._refresh_monitoring)
+        self._monitor_timer.start()
+        self._refresh_monitoring()
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -1236,6 +1259,118 @@ class ChatWindow(QtWidgets.QWidget):
         if not os.getenv(env_key):
             return f"Set {env_key} to enable {provider_info['label']} responses."
         return f"Connected to {provider_info['label']} API."
+
+    def _refresh_monitoring(self) -> None:
+        window_title, process_name = self._active_window_info()
+        cpu_load = self._cpu_load()
+        memory_usage = self._memory_usage()
+
+        self.monitoring_window_label.setText(f"Active window: {window_title}")
+        self.monitoring_process_label.setText(f"Foreground process: {process_name}")
+        self.monitoring_cpu_label.setText(
+            "CPU load: Unavailable" if cpu_load is None else f"CPU load: {cpu_load:.1f}%"
+        )
+        self.monitoring_memory_label.setText(
+            "Memory usage: Unavailable"
+            if memory_usage is None
+            else f"Memory usage: {memory_usage:.1f}%"
+        )
+
+        if window_title != self._monitor_last_window:
+            if self._monitor_last_window is not None:
+                self._log_monitor_event(f"Active window changed to '{window_title}'.")
+            self._monitor_last_window = window_title
+
+        if process_name != self._monitor_last_process:
+            if self._monitor_last_process is not None:
+                self._log_monitor_event(f"Foreground process changed to '{process_name}'.")
+            self._monitor_last_process = process_name
+
+        self._log_usage_change("CPU load", cpu_load, 10.0, "cpu")
+        self._log_usage_change("Memory usage", memory_usage, 5.0, "memory")
+
+    def _log_usage_change(self, label: str, value: Optional[float], threshold: float, kind: str) -> None:
+        if value is None:
+            return
+        if kind == "cpu":
+            previous = self._monitor_last_cpu
+            self._monitor_last_cpu = value
+        else:
+            previous = self._monitor_last_memory
+            self._monitor_last_memory = value
+
+        if previous is None:
+            return
+        if abs(value - previous) >= threshold:
+            self._log_monitor_event(f"{label} shifted to {value:.1f}%.")
+
+    def _log_monitor_event(self, message: str) -> None:
+        self.controls_panel.log(f"Monitoring: {message}")
+
+    def _active_window_info(self) -> tuple[str, str]:
+        if not sys.platform.startswith("linux"):
+            return ("Unavailable", "Unavailable")
+        if not shutil.which("xdotool"):
+            return ("Unavailable", "Unavailable")
+
+        window_id = self._run_command(["xdotool", "getactivewindow"]).strip()
+        if not window_id:
+            return ("Unavailable", "Unavailable")
+
+        title = self._run_command(["xdotool", "getactivewindow", "getwindowname"]).strip()
+        pid_raw = self._run_command(["xdotool", "getactivewindow", "getwindowpid"]).strip()
+        process = self._process_name_from_pid(pid_raw)
+
+        return (title or "Unknown", process or "Unknown")
+
+    def _process_name_from_pid(self, pid_raw: str) -> str:
+        if not pid_raw.isdigit():
+            return "Unknown"
+        pid = pid_raw.strip()
+        comm_path = Path("/proc") / pid / "comm"
+        if comm_path.exists():
+            return comm_path.read_text(encoding="utf-8").strip()
+        output = self._run_command(["ps", "-p", pid, "-o", "comm="]).strip()
+        return output or "Unknown"
+
+    def _cpu_load(self) -> Optional[float]:
+        try:
+            load_1, _, _ = os.getloadavg()
+        except (AttributeError, OSError):
+            return None
+        cpu_count = os.cpu_count() or 1
+        return min(100.0, (load_1 / cpu_count) * 100.0)
+
+    def _memory_usage(self) -> Optional[float]:
+        meminfo = Path("/proc/meminfo")
+        if not meminfo.exists():
+            return None
+        total = None
+        available = None
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                total = self._parse_kib(line)
+            elif line.startswith("MemAvailable:"):
+                available = self._parse_kib(line)
+        if total is None or available is None or total == 0:
+            return None
+        used = total - available
+        return (used / total) * 100.0
+
+    def _parse_kib(self, line: str) -> Optional[int]:
+        match = re.search(r"(\d+)", line)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _run_command(self, command: list[str]) -> str:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout or ""
 
     def _populate_provider_selector(self) -> None:
         self.provider_selector.clear()

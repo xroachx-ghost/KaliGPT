@@ -1186,6 +1186,31 @@ class ChatWindow(QtWidgets.QWidget):
         "temperature": 0.7,
         "max_tokens": 1024,
     }
+    DEFAULT_TEMPLATES = [
+        {
+            "name": "Daily routine",
+            "tasks": [
+                "Review overnight alerts",
+                "Check inbox and calendar",
+                "Plan top 3 priorities",
+                "Share standup update",
+                "Wrap up with end-of-day notes",
+            ],
+            "built_in": True,
+        },
+        {
+            "name": "Triage checklist",
+            "tasks": [
+                "Acknowledge the alert",
+                "Collect relevant logs",
+                "Assess scope and severity",
+                "Contain immediate risks",
+                "Notify stakeholders",
+                "Document findings and next steps",
+            ],
+            "built_in": True,
+        },
+    ]
 
     def __init__(self, mode: str) -> None:
         super().__init__()
@@ -1203,6 +1228,7 @@ class ChatWindow(QtWidgets.QWidget):
         }
         self._conversations: list[dict[str, str]] = []
         self._active_conversation_id: str | None = None
+        self._templates: list[dict[str, object]] = []
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -1350,6 +1376,10 @@ class ChatWindow(QtWidgets.QWidget):
         self.move_down_button.clicked.connect(lambda: self._move_task(1))
         self.complete_task_button = QtWidgets.QPushButton("Toggle Complete")
         self.complete_task_button.clicked.connect(self._toggle_complete)
+        self.apply_template_button = QtWidgets.QPushButton("Apply Template")
+        self.apply_template_button.clicked.connect(self._apply_template)
+        self.save_template_button = QtWidgets.QPushButton("Save as Template")
+        self.save_template_button.clicked.connect(self._save_template)
 
         self.agent_toggle_button = QtWidgets.QPushButton("Start Agent Loop")
         self.agent_toggle_button.setCheckable(True)
@@ -1426,9 +1456,14 @@ class ChatWindow(QtWidgets.QWidget):
         task_button_layout.addWidget(self.move_down_button, 1, 1)
         task_button_layout.addWidget(self.complete_task_button, 1, 2)
 
+        template_button_layout = QtWidgets.QHBoxLayout()
+        template_button_layout.addWidget(self.apply_template_button)
+        template_button_layout.addWidget(self.save_template_button)
+
         task_layout = QtWidgets.QVBoxLayout(self.task_panel)
         task_layout.addWidget(self.task_view)
         task_layout.addLayout(task_button_layout)
+        task_layout.addLayout(template_button_layout)
         task_layout.addWidget(self.agent_toggle_button)
 
         monitoring_layout = QtWidgets.QVBoxLayout(self.monitoring_panel)
@@ -1457,6 +1492,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._load_action_review_preference()
         self._load_behavior_preferences()
         self._load_conversations()
+        self._load_templates()
         self._load_tasks()
         self._refresh_task_snapshot()
         self._refresh_task_controls()
@@ -2228,6 +2264,9 @@ class ChatWindow(QtWidgets.QWidget):
     def _audit_log_path(self) -> Path:
         return Path.home() / ".kaligpt" / "audit.json"
 
+    def _templates_path(self) -> Path:
+        return Path.home() / ".kaligpt" / "templates.json"
+
     def _load_memory(self) -> dict[str, object]:
         memory_path = self._memory_path()
         if not memory_path.exists():
@@ -2249,6 +2288,55 @@ class ChatWindow(QtWidgets.QWidget):
         memory_path.parent.mkdir(parents=True, exist_ok=True)
         with memory_path.open("w", encoding="utf-8") as handle:
             json.dump(self._memory, handle, indent=2)
+
+    def _normalize_template(self, payload: object) -> Optional[dict[str, object]]:
+        if not isinstance(payload, dict):
+            return None
+        name = str(payload.get("name", "")).strip()
+        tasks_raw = payload.get("tasks", [])
+        if not name or not isinstance(tasks_raw, list):
+            return None
+        tasks = [str(item).strip() for item in tasks_raw if str(item).strip()]
+        if not tasks:
+            return None
+        template: dict[str, object] = {"name": name, "tasks": tasks}
+        if payload.get("built_in"):
+            template["built_in"] = True
+        return template
+
+    def _load_templates(self) -> None:
+        templates: list[dict[str, object]] = []
+        templates_path = self._templates_path()
+        if templates_path.exists():
+            try:
+                with templates_path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, list):
+                    raw_templates = payload
+                elif isinstance(payload, dict):
+                    raw_templates = payload.get("templates", [])
+                else:
+                    raw_templates = []
+                if isinstance(raw_templates, list):
+                    for item in raw_templates:
+                        normalized = self._normalize_template(item)
+                        if normalized:
+                            templates.append(normalized)
+            except (OSError, ValueError, TypeError):
+                templates = []
+
+        existing_names = {template["name"] for template in templates}
+        for default_template in self.DEFAULT_TEMPLATES:
+            if default_template["name"] not in existing_names:
+                templates.append(dict(default_template))
+        self._templates = templates
+        self._save_templates()
+
+    def _save_templates(self) -> None:
+        templates_path = self._templates_path()
+        templates_path.parent.mkdir(parents=True, exist_ok=True)
+        with templates_path.open("w", encoding="utf-8") as handle:
+            json.dump({"templates": self._templates}, handle, indent=2)
 
     def _export_audit_log(self) -> None:
         if not self._audit_log:
@@ -2778,6 +2866,87 @@ class ChatWindow(QtWidgets.QWidget):
             return
         self.task_model.toggle_complete(row)
         self._refresh_task_controls()
+
+    def _apply_template(self) -> None:
+        if not self._templates:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Apply Template",
+                "No templates are available yet.",
+            )
+            return
+        template_names = [template["name"] for template in self._templates]
+        selected, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "Apply Template",
+            "Template",
+            template_names,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        selected_name = selected.strip()
+        if not selected_name:
+            return
+        template = next(
+            (item for item in self._templates if item.get("name") == selected_name),
+            None,
+        )
+        if not template:
+            return
+        if self.task_model.rowCount() > 0:
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Apply Template",
+                "Replace the current task list with this template?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                return
+        tasks = [Task(title=title) for title in template.get("tasks", [])]
+        self.task_model.set_tasks(tasks)
+        self.task_view.scrollToBottom()
+        self._refresh_task_controls()
+
+    def _save_template(self) -> None:
+        tasks = [task.title for task in self.task_model.tasks() if task.title]
+        if not tasks:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Save Template",
+                "Add at least one task before saving a template.",
+            )
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Save Template",
+            "Template name",
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        existing_index = next(
+            (index for index, item in enumerate(self._templates) if item.get("name") == name),
+            None,
+        )
+        if existing_index is not None:
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Save Template",
+                f"Template '{name}' already exists. Replace it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                return
+        template_payload = {"name": name, "tasks": tasks}
+        if existing_index is None:
+            self._templates.append(template_payload)
+        else:
+            self._templates[existing_index] = template_payload
+        self._save_templates()
 
     def _toggle_agent_loop(self, running: bool) -> None:
         if running:

@@ -27,6 +27,7 @@ class ChatMessage:
     role: str
     content: str
     timestamp: datetime
+    reasoning: str | None = None
 
     def to_display(self) -> str:
         time_str = self.timestamp.strftime("%H:%M:%S")
@@ -370,6 +371,32 @@ class ChatWindow(QtWidgets.QWidget):
 
         self.controls_panel = ComputerControlPanel()
 
+        self.reasoning_panel = QtWidgets.QGroupBox("Agent Reasoning")
+        self.reasoning_input = QtWidgets.QPlainTextEdit()
+        self.reasoning_input.setPlaceholderText("Draft or edit the agent reasoning context here.")
+        self.reasoning_input.setReadOnly(True)
+
+        self.pause_agent_button = QtWidgets.QPushButton("Pause Agent")
+        self.pause_agent_button.setCheckable(True)
+        self.pause_agent_button.toggled.connect(self._toggle_agent_pause)
+
+        self.edit_reasoning_button = QtWidgets.QPushButton("Edit Reasoning")
+        self.edit_reasoning_button.clicked.connect(self._enable_reasoning_edit)
+        self.edit_reasoning_button.setEnabled(False)
+
+        self.continue_agent_button = QtWidgets.QPushButton("Continue")
+        self.continue_agent_button.clicked.connect(self._continue_agent)
+        self.continue_agent_button.setEnabled(False)
+
+        reasoning_buttons = QtWidgets.QHBoxLayout()
+        reasoning_buttons.addWidget(self.pause_agent_button)
+        reasoning_buttons.addWidget(self.edit_reasoning_button)
+        reasoning_buttons.addWidget(self.continue_agent_button)
+
+        reasoning_layout = QtWidgets.QVBoxLayout(self.reasoning_panel)
+        reasoning_layout.addWidget(self.reasoning_input)
+        reasoning_layout.addLayout(reasoning_buttons)
+
         self.api_status = QtWidgets.QLabel()
         self.api_status.setText(self._api_status_text())
         self.api_status.setStyleSheet("color: #9aa0a6; font-size: 12px;")
@@ -397,9 +424,17 @@ class ChatWindow(QtWidgets.QWidget):
         chat_layout.addLayout(input_layout)
         chat_layout.addWidget(self.api_status)
 
+        side_layout = QtWidgets.QVBoxLayout()
+        side_layout.addWidget(self.controls_panel)
+        side_layout.addWidget(self.reasoning_panel)
+        side_layout.addStretch()
+
         main_layout = QtWidgets.QHBoxLayout(self)
         main_layout.addLayout(chat_layout, stretch=3)
-        main_layout.addWidget(self.controls_panel, stretch=2)
+        main_layout.addLayout(side_layout, stretch=2)
+
+        self._agent_paused = False
+        self._pending_agent_step = False
 
         self._apply_theme()
         self._configure_mode()
@@ -418,6 +453,13 @@ class ChatWindow(QtWidgets.QWidget):
                 border: none;
             }
             QTextEdit {
+                background: #2b2c2f;
+                border: 1px solid #3e3f4b;
+                border-radius: 12px;
+                padding: 10px;
+                color: #f5f5f5;
+            }
+            QPlainTextEdit {
                 background: #2b2c2f;
                 border: 1px solid #3e3f4b;
                 border-radius: 12px;
@@ -472,6 +514,8 @@ class ChatWindow(QtWidgets.QWidget):
         self.controls_panel.setVisible(is_agent_mode)
         self.controls_panel.setEnabled(is_agent_mode)
         self.controls_panel.set_agent_mode(is_agent_mode)
+        self.reasoning_panel.setVisible(is_agent_mode)
+        self.reasoning_panel.setEnabled(is_agent_mode)
         if not is_agent_mode:
             self.controls_panel.setChecked(False)
 
@@ -494,6 +538,7 @@ class ChatWindow(QtWidgets.QWidget):
                     role=item["role"],
                     content=item["content"],
                     timestamp=datetime.fromisoformat(item["timestamp"]),
+                    reasoning=item.get("reasoning"),
                 )
                 self.chat_model.add_message(message)
         except (OSError, ValueError, KeyError):
@@ -507,6 +552,7 @@ class ChatWindow(QtWidgets.QWidget):
                 "role": msg.role,
                 "content": msg.content,
                 "timestamp": msg.timestamp.isoformat(),
+                "reasoning": msg.reasoning,
             }
             for msg in self.chat_model._messages
         ]
@@ -526,15 +572,23 @@ class ChatWindow(QtWidgets.QWidget):
             return
         self._add_message("user", content)
         self.message_input.clear()
-        response = self._generate_response()
-        self._add_message("assistant", response)
+        if self._agent_paused:
+            self._pending_agent_step = True
+            return
+        response = self._generate_response(self._agent_reasoning())
+        self._add_message("assistant", response, reasoning=self._agent_reasoning())
 
-    def _add_message(self, role: str, content: str) -> None:
-        message = ChatMessage(role=role, content=content, timestamp=datetime.now())
+    def _add_message(self, role: str, content: str, reasoning: str | None = None) -> None:
+        message = ChatMessage(
+            role=role,
+            content=content,
+            timestamp=datetime.now(),
+            reasoning=reasoning,
+        )
         self.chat_model.add_message(message)
         self.chat_view.scrollToBottom()
 
-    def _generate_response(self) -> str:
+    def _generate_response(self, reasoning: str | None = None) -> str:
         if openai is None or not os.getenv("OPENAI_API_KEY"):
             return (
                 "I'm ready to help. Install the OpenAI SDK and set OPENAI_API_KEY "
@@ -542,13 +596,51 @@ class ChatWindow(QtWidgets.QWidget):
             )
         client = openai.OpenAI()
         try:
+            messages = self.chat_model.as_openai_messages()
+            if reasoning:
+                messages.insert(0, {"role": "system", "content": f"Agent reasoning context:\n{reasoning}"})
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=self.chat_model.as_openai_messages(),
+                messages=messages,
             )
             return completion.choices[0].message.content
         except Exception as exc:  # pragma: no cover - network call
             return f"API error: {exc}"
+
+    def _agent_reasoning(self) -> str | None:
+        text = self.reasoning_input.toPlainText().strip()
+        return text or None
+
+    def _toggle_agent_pause(self, paused: bool) -> None:
+        self._agent_paused = paused
+        self.edit_reasoning_button.setEnabled(paused)
+        self.continue_agent_button.setEnabled(paused)
+        if paused:
+            self.reasoning_input.setReadOnly(False)
+            self.reasoning_input.setFocus()
+        else:
+            self.reasoning_input.setReadOnly(True)
+
+    def _enable_reasoning_edit(self) -> None:
+        if not self._agent_paused:
+            return
+        self.reasoning_input.setReadOnly(False)
+        self.reasoning_input.setFocus()
+
+    def _continue_agent(self) -> None:
+        if not self._agent_paused:
+            return
+        self._agent_paused = False
+        self.pause_agent_button.blockSignals(True)
+        self.pause_agent_button.setChecked(False)
+        self.pause_agent_button.blockSignals(False)
+        self.edit_reasoning_button.setEnabled(False)
+        self.continue_agent_button.setEnabled(False)
+        self.reasoning_input.setReadOnly(True)
+        if self._pending_agent_step:
+            response = self._generate_response(self._agent_reasoning())
+            self._add_message("assistant", response, reasoning=self._agent_reasoning())
+            self._pending_agent_step = False
 
 
 def main() -> int:

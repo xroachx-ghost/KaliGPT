@@ -926,6 +926,117 @@ class ModeSelectionDialog(QtWidgets.QDialog):
         return "agent" if self.agent_mode_radio.isChecked() else "normal"
 
 
+API_KEY_HINTS = {
+    "openai": ["sk-"],
+    "anthropic": ["sk-ant-"],
+    "deepseek": ["sk-"],
+    "gemini": ["AIza"],
+    "groq": ["gsk_"],
+    "mistral": ["sk-"],
+    "perplexity": ["pplx-"],
+}
+
+
+class FirstRunWizard(QtWidgets.QWizard):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("KaliGPT first-run setup")
+        self.setWizardStyle(QtWidgets.QWizard.ModernStyle)
+
+        self.provider_selector = QtWidgets.QComboBox()
+        self.api_key_inputs: dict[str, QtWidgets.QLineEdit] = {}
+        self.api_key_status: dict[str, QtWidgets.QLabel] = {}
+        self.desktop_control_toggle = QtWidgets.QCheckBox("Enable desktop control tools")
+
+        self._build_pages()
+
+    def _build_pages(self) -> None:
+        provider_page = QtWidgets.QWizardPage()
+        provider_page.setTitle("Choose your default provider")
+        provider_page.setSubTitle("Pick the provider you want to use for chat responses.")
+        provider_layout = QtWidgets.QVBoxLayout(provider_page)
+        provider_layout.addWidget(QtWidgets.QLabel("Provider"))
+        for provider, info in PROVIDER_REGISTRY.items():
+            self.provider_selector.addItem(info["label"], provider)
+        provider_layout.addWidget(self.provider_selector)
+        provider_layout.addStretch()
+        self.addPage(provider_page)
+
+        api_keys_page = QtWidgets.QWizardPage()
+        api_keys_page.setTitle("Add API keys")
+        api_keys_page.setSubTitle(
+            "Keys are stored locally in ~/.kaligpt/memory.json. Leave a field blank to use demo mode."
+        )
+        api_layout = QtWidgets.QFormLayout(api_keys_page)
+        for provider, info in PROVIDER_REGISTRY.items():
+            entry_row = QtWidgets.QHBoxLayout()
+            key_input = QtWidgets.QLineEdit()
+            key_input.setEchoMode(QtWidgets.QLineEdit.Password)
+            key_input.setPlaceholderText(f"{info['label']} API key")
+            help_label = QtWidgets.QLabel(
+                f"Env: {info['env_key']}"
+                + (
+                    f" • Common prefix: {', '.join(API_KEY_HINTS[provider])}"
+                    if provider in API_KEY_HINTS
+                    else ""
+                )
+            )
+            help_label.setStyleSheet("color: #9aa0a6; font-size: 11px;")
+            status_label = QtWidgets.QLabel("Missing (demo mode)")
+            status_label.setStyleSheet("color: #f0b429; font-size: 11px;")
+            entry_row.addWidget(key_input, stretch=2)
+            entry_row.addWidget(help_label, stretch=3)
+            entry_row.addWidget(status_label, stretch=1)
+            api_layout.addRow(info["label"], entry_row)
+            self.api_key_inputs[provider] = key_input
+            self.api_key_status[provider] = status_label
+            key_input.textChanged.connect(
+                lambda text, provider=provider: self._update_api_key_status(provider, text)
+            )
+        self.addPage(api_keys_page)
+
+        control_page = QtWidgets.QWizardPage()
+        control_page.setTitle("Desktop control")
+        control_page.setSubTitle(
+            "Enable desktop control to allow automation tools when in agent mode."
+        )
+        control_layout = QtWidgets.QVBoxLayout(control_page)
+        control_layout.addWidget(self.desktop_control_toggle)
+        control_layout.addStretch()
+        self.addPage(control_page)
+
+    def selected_provider(self) -> str:
+        data = self.provider_selector.currentData()
+        if isinstance(data, str):
+            return data
+        return list(PROVIDER_REGISTRY.keys())[0]
+
+    def api_keys(self) -> dict[str, str]:
+        keys: dict[str, str] = {}
+        for provider, input_widget in self.api_key_inputs.items():
+            value = input_widget.text().strip()
+            if value:
+                keys[provider] = value
+        return keys
+
+    def desktop_control_enabled(self) -> bool:
+        return self.desktop_control_toggle.isChecked()
+
+    def _update_api_key_status(self, provider: str, text: str) -> None:
+        status_label = self.api_key_status[provider]
+        value = text.strip()
+        if not value:
+            status_label.setText("Missing (demo mode)")
+            status_label.setStyleSheet("color: #f0b429; font-size: 11px;")
+            return
+        hints = API_KEY_HINTS.get(provider, [])
+        if hints and not any(value.startswith(prefix) for prefix in hints):
+            status_label.setText(f"Check format (expected {', '.join(hints)})")
+            status_label.setStyleSheet("color: #f0b429; font-size: 11px;")
+            return
+        status_label.setText("Looks good")
+        status_label.setStyleSheet("color: #6ee7b7; font-size: 11px;")
+
 class ChatWindow(QtWidgets.QWidget):
     DEFAULT_PREFERENCES = {
         "persona": "General assistant",
@@ -941,6 +1052,8 @@ class ChatWindow(QtWidgets.QWidget):
         self.resize(1200, 720)
 
         self._memory = self._load_memory()
+        self._first_run = self._needs_first_run_wizard()
+        self._suppress_api_prompt = self._first_run
         self._load_api_keys()
 
         self.chat_model = ChatModel(self)
@@ -1012,6 +1125,9 @@ class ChatWindow(QtWidgets.QWidget):
         self.send_button.clicked.connect(self.handle_send)
 
         self.controls_panel = ComputerControlPanel()
+        self.controls_panel.enable_control_toggle.toggled.connect(
+            self._persist_desktop_control_preference
+        )
         self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
         self.monitoring_window_label = QtWidgets.QLabel("Active window: Unavailable")
         self.monitoring_process_label = QtWidgets.QLabel("Foreground process: Unavailable")
@@ -1059,11 +1175,12 @@ class ChatWindow(QtWidgets.QWidget):
         self._agent_thread.start()
 
         self.api_status = QtWidgets.QLabel()
-        self.api_status.setText(self._api_status_text())
         self.api_status.setStyleSheet("color: #9aa0a6; font-size: 12px;")
 
         header_title = QtWidgets.QLabel("KaliGPT")
         header_title.setObjectName("HeaderTitle")
+        self.demo_mode_banner = QtWidgets.QLabel("Demo mode: API key missing")
+        self.demo_mode_banner.setObjectName("DemoModeBanner")
         header_subtitle = QtWidgets.QLabel("Your AI assistant for secure workflows")
         header_subtitle.setObjectName("HeaderSubtitle")
         self.preferences_label = QtWidgets.QLabel()
@@ -1072,6 +1189,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         header_layout = QtWidgets.QVBoxLayout()
         header_layout.addWidget(header_title)
+        header_layout.addWidget(self.demo_mode_banner)
         header_layout.addWidget(header_subtitle)
         header_layout.addWidget(self.preferences_label)
         header_layout.setSpacing(2)
@@ -1133,6 +1251,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         self._apply_theme()
         self._configure_mode()
+        self._load_desktop_control_preference()
         self._load_behavior_preferences()
         self._load_history()
         self._load_tasks()
@@ -1146,6 +1265,8 @@ class ChatWindow(QtWidgets.QWidget):
         self._monitor_timer.timeout.connect(self._refresh_monitoring)
         self._monitor_timer.start()
         self._refresh_monitoring()
+        self._update_api_status()
+        self._maybe_show_first_run_wizard()
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -1209,6 +1330,13 @@ class ChatWindow(QtWidgets.QWidget):
             QLabel#HeaderPreferences {
                 color: #9aa0a6;
                 font-size: 12px;
+            }
+            QLabel#DemoModeBanner {
+                background: #2f1f1f;
+                color: #f87171;
+                border-radius: 6px;
+                padding: 4px 8px;
+                font-weight: 600;
             }
             QTableView {
                 background: #202123;
@@ -1443,11 +1571,11 @@ class ChatWindow(QtWidgets.QWidget):
         self._populate_model_selector()
         self._persist_model_selection()
         self._maybe_prompt_api_key()
-        self.api_status.setText(self._api_status_text())
+        self._update_api_status()
 
     def _handle_model_change(self, *_: object) -> None:
         self._persist_model_selection()
-        self.api_status.setText(self._api_status_text())
+        self._update_api_status()
 
     def _load_history(self) -> None:
         history_path = self._history_path()
@@ -1522,6 +1650,8 @@ class ChatWindow(QtWidgets.QWidget):
                     os.environ[env_key] = key
 
     def _maybe_prompt_api_key(self) -> None:
+        if self._suppress_api_prompt:
+            return
         provider = self._selected_provider()
         if not provider:
             return
@@ -1546,6 +1676,79 @@ class ChatWindow(QtWidgets.QWidget):
         api_keys = self._memory.setdefault("api_keys", {})
         if isinstance(api_keys, dict):
             api_keys[provider] = key
+        self._save_memory()
+        self._update_api_status()
+
+    def _update_api_status(self) -> None:
+        status_text = self._api_status_text()
+        self.api_status.setText(status_text)
+        self._update_demo_mode_banner(status_text)
+
+    def _update_demo_mode_banner(self, status_text: str) -> None:
+        text = status_text.lower()
+        show_banner = "stubbed" in text or ("set " in text and " to enable" in text)
+        self.demo_mode_banner.setVisible(show_banner)
+
+    def _needs_first_run_wizard(self) -> bool:
+        memory_path = self._memory_path()
+        if not memory_path.exists():
+            return True
+        preferences = self._memory.get("preferences")
+        return not isinstance(preferences, dict) or not preferences
+
+    def _maybe_show_first_run_wizard(self) -> None:
+        if not self._first_run:
+            return
+        wizard = FirstRunWizard(self)
+        result = wizard.exec()
+        if result == QtWidgets.QDialog.Accepted:
+            self._apply_first_run_settings(wizard)
+        self._suppress_api_prompt = False
+
+    def _apply_first_run_settings(self, wizard: FirstRunWizard) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        provider = wizard.selected_provider()
+        preferences["provider"] = provider
+        model_map = preferences.get("model_map")
+        if not isinstance(model_map, dict):
+            model_map = {}
+        model_map[provider] = PROVIDER_REGISTRY[provider]["models"][0]["id"]
+        preferences["model_map"] = model_map
+        preferences["desktop_control_enabled"] = wizard.desktop_control_enabled()
+
+        api_keys = self._memory.setdefault("api_keys", {})
+        if not isinstance(api_keys, dict):
+            api_keys = {}
+            self._memory["api_keys"] = api_keys
+        for provider_name, key in wizard.api_keys().items():
+            api_keys[provider_name] = key
+            env_key = PROVIDER_REGISTRY[provider_name]["env_key"]
+            if not os.getenv(env_key):
+                os.environ[env_key] = key
+
+        self._save_memory()
+        self._populate_provider_selector()
+        self._load_desktop_control_preference()
+        self._update_api_status()
+
+    def _load_desktop_control_preference(self) -> None:
+        preferences = self._memory.get("preferences", {})
+        if not isinstance(preferences, dict):
+            return
+        enabled = bool(preferences.get("desktop_control_enabled", False))
+        self.controls_panel.enable_control_toggle.blockSignals(True)
+        self.controls_panel.enable_control_toggle.setChecked(enabled)
+        self.controls_panel.enable_control_toggle.blockSignals(False)
+
+    def _persist_desktop_control_preference(self, enabled: bool) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["desktop_control_enabled"] = enabled
         self._save_memory()
 
     def _optional_module(self, module_name: str):

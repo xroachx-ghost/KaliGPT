@@ -1333,7 +1333,7 @@ class FirstRunWizard(QtWidgets.QWizard):
         status_label.setText("Looks good")
         status_label.setStyleSheet("color: #6ee7b7; font-size: 11px;")
 
-class ChatWindow(QtWidgets.QWidget):
+class ChatWindow(QtWidgets.QMainWindow):
     DEFAULT_PREFERENCES = {
         "persona": "General assistant",
         "tone": "Neutral",
@@ -1371,6 +1371,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.mode = mode
         self.setWindowTitle("KaliGPT Workstation")
         self.resize(1200, 720)
+        self._compact_layout: Optional[bool] = None
 
         self._memory = self._load_memory()
         self._audit_log = self._load_audit_log()
@@ -1408,6 +1409,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         self.menu_bar = QtWidgets.QMenuBar()
         self.menu_bar.setNativeMenuBar(False)
+        self.setMenuBar(self.menu_bar)
         file_menu = self.menu_bar.addMenu("File")
         self.new_conversation_action = QtGui.QAction("New Conversation", self)
         self.import_json_action = QtGui.QAction("Import JSON...", self)
@@ -1600,7 +1602,6 @@ class ChatWindow(QtWidgets.QWidget):
         search_layout.addWidget(self.search_input, stretch=1)
 
         chat_layout = QtWidgets.QVBoxLayout()
-        chat_layout.addWidget(self.menu_bar)
         chat_layout.addWidget(header_widget)
         chat_layout.addLayout(conversation_layout)
         chat_layout.addLayout(search_layout)
@@ -1649,16 +1650,58 @@ class ChatWindow(QtWidgets.QWidget):
 
         right_layout = QtWidgets.QVBoxLayout()
         right_layout.addWidget(self.task_panel)
-        right_layout.addWidget(self.controls_panel)
-        right_layout.addWidget(self.monitoring_panel)
         right_layout.addStretch()
 
         right_widget = QtWidgets.QWidget()
         right_widget.setLayout(right_layout)
 
-        main_layout = QtWidgets.QHBoxLayout(self)
-        main_layout.addLayout(chat_layout, stretch=3)
-        main_layout.addWidget(right_widget, stretch=2)
+        chat_widget = QtWidgets.QWidget()
+        chat_widget.setLayout(chat_layout)
+
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.addWidget(chat_widget)
+        self.main_splitter.addWidget(right_widget)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.setCentralWidget(self.main_splitter)
+
+        self.controls_dock = QtWidgets.QDockWidget("Computer Control", self)
+        self.controls_dock.setObjectName("ControlsDock")
+        self.controls_dock.setWidget(self.controls_panel)
+        self.controls_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+            | QtWidgets.QDockWidget.DockWidgetClosable
+        )
+        self.controls_dock.setAllowedAreas(
+            QtCore.Qt.RightDockWidgetArea | QtCore.Qt.BottomDockWidgetArea
+        )
+
+        self.monitoring_dock = QtWidgets.QDockWidget("Monitoring", self)
+        self.monitoring_dock.setObjectName("MonitoringDock")
+        self.monitoring_dock.setWidget(self.monitoring_panel)
+        self.monitoring_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+            | QtWidgets.QDockWidget.DockWidgetClosable
+        )
+        self.monitoring_dock.setAllowedAreas(
+            QtCore.Qt.RightDockWidgetArea | QtCore.Qt.BottomDockWidgetArea
+        )
+
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.controls_dock)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.monitoring_dock)
+        self.splitDockWidget(
+            self.controls_dock, self.monitoring_dock, QtCore.Qt.Vertical
+        )
+
+        self._chat_layout = chat_layout
+        self._right_layout = right_layout
+        self._header_layout = header_layout
+        self._conversation_layout = conversation_layout
+        self._search_layout = search_layout
+        self._input_layout = input_layout
+        self._model_layout = model_layout
 
         self._apply_theme()
         self._configure_mode()
@@ -1684,6 +1727,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._refresh_monitoring()
         self._update_api_status()
         self._maybe_show_first_run_wizard()
+        self._apply_layout_breakpoint(self.width())
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -1692,6 +1736,11 @@ class ChatWindow(QtWidgets.QWidget):
                 background: #202123;
                 color: #e8e8e8;
                 font-size: 14px;
+            }
+            QMainWindow::separator {
+                background: #2b2c2f;
+                width: 1px;
+                height: 1px;
             }
             QListView {
                 background: #202123;
@@ -1703,6 +1752,20 @@ class ChatWindow(QtWidgets.QWidget):
                 border-radius: 12px;
                 padding: 10px;
                 color: #f5f5f5;
+            }
+            QPlainTextEdit,
+            QLineEdit,
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox {
+                background: #2b2c2f;
+                border: 1px solid #3e3f4b;
+                border-radius: 8px;
+                padding: 6px 8px;
+                color: #f5f5f5;
+            }
+            QComboBox::drop-down {
+                border: none;
             }
             QPushButton {
                 background: #10a37f;
@@ -1726,14 +1789,23 @@ class ChatWindow(QtWidgets.QWidget):
                 background: #2b2c2f;
                 border: 1px solid #3e3f4b;
                 border-radius: 12px;
-                margin-top: 14px;
-                padding: 12px;
+                margin-top: 18px;
+                padding: 14px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
+                left: 14px;
+                padding: 0 8px;
                 color: #e8e8e8;
+                font-weight: 600;
+            }
+            QDockWidget {
+                background: #202123;
+                border: 1px solid #3e3f4b;
+            }
+            QDockWidget::title {
+                background: #2b2c2f;
+                padding: 6px 10px;
                 font-weight: 600;
             }
             QLabel#HeaderTitle {
@@ -1747,6 +1819,11 @@ class ChatWindow(QtWidgets.QWidget):
             QLabel#HeaderPreferences {
                 color: #9aa0a6;
                 font-size: 12px;
+            }
+            QLabel#HeaderTitle,
+            QLabel#HeaderSubtitle,
+            QLabel#HeaderPreferences {
+                padding-left: 2px;
             }
             QLabel#DemoModeBanner {
                 background: #2f1f1f;
@@ -1771,11 +1848,56 @@ class ChatWindow(QtWidgets.QWidget):
             QHeaderView::section {
                 background: #2b2c2f;
                 color: #e8e8e8;
-                padding: 6px;
+                padding: 8px;
                 border: none;
                 font-weight: 600;
             }
             """
+        )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_layout_breakpoint(event.size().width())
+
+    def _apply_layout_breakpoint(self, width: int) -> None:
+        compact = width < 980
+        if compact == self._compact_layout:
+            return
+        self._compact_layout = compact
+
+        orientation = QtCore.Qt.Vertical if compact else QtCore.Qt.Horizontal
+        dock_area = (
+            QtCore.Qt.BottomDockWidgetArea
+            if compact
+            else QtCore.Qt.RightDockWidgetArea
+        )
+        spacing = 8 if compact else 12
+        margin = 12 if compact else 16
+
+        self.main_splitter.setOrientation(orientation)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+
+        for layout in (
+            self._chat_layout,
+            self._right_layout,
+        ):
+            layout.setSpacing(spacing)
+            layout.setContentsMargins(margin, margin, margin, margin)
+
+        for layout in (
+            self._header_layout,
+            self._conversation_layout,
+            self._search_layout,
+            self._input_layout,
+            self._model_layout,
+        ):
+            layout.setSpacing(spacing)
+
+        self.addDockWidget(dock_area, self.controls_dock)
+        self.addDockWidget(dock_area, self.monitoring_dock)
+        self.splitDockWidget(
+            self.controls_dock, self.monitoring_dock, QtCore.Qt.Vertical
         )
 
     def _configure_mode(self) -> None:

@@ -148,6 +148,63 @@ class Task:
         return cls(title=title, completed=bool(payload.get("completed", False)))
 
 
+@dataclass
+class RoutineAction:
+    action: str
+    parameters: dict[str, object]
+    condition: Optional[str] = None
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "action": self.action,
+            "parameters": self.parameters,
+        }
+        if self.condition:
+            payload["condition"] = self.condition
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> Optional["RoutineAction"]:
+        action = payload.get("action")
+        parameters = payload.get("parameters")
+        if not isinstance(action, str) or not isinstance(parameters, dict):
+            return None
+        condition_value = payload.get("condition")
+        condition = str(condition_value).strip() if condition_value else None
+        return cls(action=action, parameters=parameters, condition=condition)
+
+
+@dataclass
+class Routine:
+    name: str
+    actions: list[RoutineAction]
+    created_at: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "created_at": self.created_at,
+            "actions": [action.to_payload() for action in self.actions],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> Optional["Routine"]:
+        name = str(payload.get("name", "")).strip()
+        actions_raw = payload.get("actions", [])
+        created_at = str(payload.get("created_at", "")).strip()
+        if not name or not isinstance(actions_raw, list):
+            return None
+        actions: list[RoutineAction] = []
+        for item in actions_raw:
+            if isinstance(item, dict):
+                action = RoutineAction.from_payload(item)
+                if action:
+                    actions.append(action)
+        if not actions:
+            return None
+        return cls(name=name, actions=actions, created_at=created_at or datetime.now().isoformat())
+
+
 class AgentState(str, Enum):
     RUNNING = "Running"
     PAUSED = "Paused"
@@ -456,6 +513,7 @@ class TaskModel(QtCore.QAbstractTableModel):
 class ComputerControlPanel(QtWidgets.QGroupBox):
     screenshot_captured = QtCore.Signal(QtGui.QPixmap)
     export_audit_requested = QtCore.Signal()
+    manual_action_triggered = QtCore.Signal(dict)
     preview_interval_ms = 1000
     AUTOMATION_UNAVAILABLE_MESSAGE = (
         "Automation unavailable. Install pyautogui and grant OS accessibility permissions "
@@ -490,6 +548,19 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             "Review action batches before execution"
         )
         self.batch_review_toggle.setChecked(True)
+
+        self.dry_run_toggle = QtWidgets.QCheckBox("Dry run (log actions only)")
+        self.dry_run_toggle.setToolTip(
+            "When enabled, actions are logged but not executed."
+        )
+        self.dry_run_toggle.toggled.connect(lambda _: self._update_permission_summary())
+
+        self.screenshot_context_toggle = QtWidgets.QCheckBox(
+            "Use screenshot context before responses"
+        )
+        self.screenshot_context_toggle.setToolTip(
+            "Capture a screenshot, analyze it, then respond with actions."
+        )
 
         self.permission_scope_panel = QtWidgets.QGroupBox("Permission Scope")
         self.permission_scope_label = QtWidgets.QLabel()
@@ -627,6 +698,24 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         manual_layout.addWidget(QtWidgets.QLabel("Press key"), 6, 0)
         manual_layout.addLayout(key_row, 6, 1)
 
+        self.routines_group = QtWidgets.QGroupBox("Routines")
+        self.routine_selector = QtWidgets.QComboBox()
+        self.routine_selector.addItem("No routines saved", None)
+        self.record_routine_button = QtWidgets.QPushButton("Record Routine")
+        self.record_routine_button.setCheckable(True)
+        self.save_routine_button = QtWidgets.QPushButton("Save Routine")
+        self.run_routine_button = QtWidgets.QPushButton("Run Routine")
+        self.run_routine_button.setEnabled(False)
+
+        routine_buttons = QtWidgets.QHBoxLayout()
+        routine_buttons.addWidget(self.record_routine_button)
+        routine_buttons.addWidget(self.save_routine_button)
+        routine_buttons.addWidget(self.run_routine_button)
+
+        routine_layout = QtWidgets.QVBoxLayout(self.routines_group)
+        routine_layout.addWidget(self.routine_selector)
+        routine_layout.addLayout(routine_buttons)
+
         self.activity_log = QtWidgets.QPlainTextEdit()
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Automation log will appear here.")
@@ -639,6 +728,8 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.automation_banner)
         layout.addWidget(self.enable_control_toggle)
         layout.addWidget(self.batch_review_toggle)
+        layout.addWidget(self.dry_run_toggle)
+        layout.addWidget(self.screenshot_context_toggle)
         layout.addWidget(self.permission_scope_panel)
         control_row = QtWidgets.QHBoxLayout()
         control_row.addWidget(self.emergency_stop_button)
@@ -649,6 +740,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.preview_toggle_button)
         layout.addWidget(delay_widget)
         layout.addWidget(self.manual_controls_group)
+        layout.addWidget(self.routines_group)
         layout.addWidget(self.activity_log)
         layout.addWidget(self.export_audit_button)
         self.screenshot_captured.connect(self.update_preview)
@@ -673,6 +765,35 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.activity_log.appendPlainText(f"[{timestamp}] {message}")
+
+    def is_dry_run_enabled(self) -> bool:
+        return self.dry_run_toggle.isChecked()
+
+    def is_screenshot_context_enabled(self) -> bool:
+        return self.screenshot_context_toggle.isChecked()
+
+    def set_routines(self, routines: list[Routine]) -> None:
+        self.routine_selector.blockSignals(True)
+        self.routine_selector.clear()
+        if not routines:
+            self.routine_selector.addItem("No routines saved", None)
+            self.run_routine_button.setEnabled(False)
+        else:
+            for routine in routines:
+                label = f"{routine.name} ({len(routine.actions)} actions)"
+                self.routine_selector.addItem(label, routine.name)
+            self.run_routine_button.setEnabled(True)
+        self.routine_selector.blockSignals(False)
+
+    def selected_routine_name(self) -> Optional[str]:
+        data = self.routine_selector.currentData()
+        return data if isinstance(data, str) else None
+
+    def set_recording_state(self, recording: bool) -> None:
+        if recording:
+            self.record_routine_button.setText("Stop Recording")
+        else:
+            self.record_routine_button.setText("Record Routine")
 
     def handle_control_toggle(self, enabled: bool) -> None:
         if pyautogui is None:
@@ -842,8 +963,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             status = "disabled"
         else:
             status = "enabled"
+        dry_run = "on" if self.dry_run_toggle.isChecked() else "off"
         self.permission_scope_label.setText(
-            f"Allowed: {allowed}.\nStatus: {status}."
+            f"Allowed: {allowed}.\nStatus: {status}.\nDry run: {dry_run}."
         )
 
     def _action_delay_seconds(self) -> float:
@@ -861,21 +983,41 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             time.sleep(delay)
 
     def handle_move_mouse(self) -> None:
-        self.move_mouse(self.mouse_x_spin.value(), self.mouse_y_spin.value())
+        x = self.mouse_x_spin.value()
+        y = self.mouse_y_spin.value()
+        self.manual_action_triggered.emit(
+            {"action": "move_mouse", "parameters": {"x": x, "y": y}}
+        )
+        self.move_mouse(x, y)
 
     def handle_click_mouse(self) -> None:
         button_data = self.click_button_combo.currentData()
         button = button_data if isinstance(button_data, str) else "left"
-        self.click_mouse(button=button, clicks=self.click_count_spin.value(), interval=0.0)
+        clicks = self.click_count_spin.value()
+        self.manual_action_triggered.emit(
+            {
+                "action": "click_mouse",
+                "parameters": {"button": button, "clicks": clicks, "interval": 0.0},
+            }
+        )
+        self.click_mouse(button=button, clicks=clicks, interval=0.0)
 
     def handle_type_text(self) -> None:
-        self.type_text(self.type_text_input.toPlainText())
+        text = self.type_text_input.toPlainText()
+        if text:
+            self.manual_action_triggered.emit(
+                {"action": "type_text", "parameters": {"text": text}}
+            )
+        self.type_text(text)
 
     def handle_press_key(self) -> None:
         key = self.key_input.text().strip()
         if not key:
             self.log("Key press skipped: no key provided.")
             return
+        self.manual_action_triggered.emit(
+            {"action": "press_key", "parameters": {"key": key}}
+        )
         self.press_key(key)
 
     def move_mouse(self, x: int, y: int, duration: Optional[float] = None) -> bool:
@@ -883,6 +1025,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             return False
         move_duration = self.move_duration_spin.value() if duration is None else duration
         self.log(f"Moving mouse to ({x}, {y}) over {move_duration:.2f}s.")
+        if self.dry_run_toggle.isChecked():
+            self.log("Dry run: move mouse skipped.")
+            return True
         self._apply_action_delay()
         pyautogui.moveTo(x, y, duration=move_duration)
         return True
@@ -896,6 +1041,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         if not self._control_allowed("Mouse click"):
             return False
         self.log(f"Clicking mouse: button={button}, clicks={clicks}.")
+        if self.dry_run_toggle.isChecked():
+            self.log("Dry run: mouse click skipped.")
+            return True
         self._apply_action_delay()
         pyautogui.click(button=button, clicks=clicks, interval=interval)
         return True
@@ -908,6 +1056,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             return False
         interval = self.typing_interval_spin.value()
         self.log(f"Typing {len(text)} characters at {interval:.2f}s interval.")
+        if self.dry_run_toggle.isChecked():
+            self.log("Dry run: typing skipped.")
+            return True
         self._apply_action_delay()
         pyautogui.write(text, interval=interval)
         return True
@@ -916,6 +1067,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         if not self._control_allowed("Key press"):
             return False
         self.log(f"Pressing key: {key}.")
+        if self.dry_run_toggle.isChecked():
+            self.log("Dry run: key press skipped.")
+            return True
         self._apply_action_delay()
         pyautogui.press(key)
         return True
@@ -1229,6 +1383,9 @@ class ChatWindow(QtWidgets.QWidget):
         self._conversations: list[dict[str, str]] = []
         self._active_conversation_id: str | None = None
         self._templates: list[dict[str, object]] = []
+        self._routines: list[Routine] = []
+        self._recording_actions: list[RoutineAction] = []
+        self._recording_active = False
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -1340,6 +1497,24 @@ class ChatWindow(QtWidgets.QWidget):
         )
         self.controls_panel.batch_review_toggle.toggled.connect(
             self._persist_action_review_preference
+        )
+        self.controls_panel.dry_run_toggle.toggled.connect(
+            self._persist_dry_run_preference
+        )
+        self.controls_panel.screenshot_context_toggle.toggled.connect(
+            self._persist_screenshot_context_preference
+        )
+        self.controls_panel.record_routine_button.toggled.connect(
+            self._handle_record_routine_toggle
+        )
+        self.controls_panel.save_routine_button.clicked.connect(
+            self._save_recorded_routine
+        )
+        self.controls_panel.run_routine_button.clicked.connect(
+            self._run_selected_routine
+        )
+        self.controls_panel.manual_action_triggered.connect(
+            self._handle_manual_action
         )
         self.controls_panel.export_audit_requested.connect(self._export_audit_log)
         self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
@@ -1490,10 +1665,13 @@ class ChatWindow(QtWidgets.QWidget):
         self._build_provider_status_widgets()
         self._load_desktop_control_preference()
         self._load_action_review_preference()
+        self._load_dry_run_preference()
+        self._load_screenshot_context_preference()
         self._load_behavior_preferences()
         self._load_conversations()
         self._load_templates()
         self._load_tasks()
+        self._load_routines()
         self._refresh_task_snapshot()
         self._refresh_task_controls()
         self.task_view.selectionModel().selectionChanged.connect(
@@ -2270,7 +2448,13 @@ class ChatWindow(QtWidgets.QWidget):
     def _load_memory(self) -> dict[str, object]:
         memory_path = self._memory_path()
         if not memory_path.exists():
-            return {"preferences": {}, "task_outcomes": [], "failures": [], "api_keys": {}}
+            return {
+                "preferences": {},
+                "task_outcomes": [],
+                "failures": [],
+                "api_keys": {},
+                "routines": [],
+            }
         try:
             with memory_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -2279,9 +2463,16 @@ class ChatWindow(QtWidgets.QWidget):
                 "task_outcomes": list(payload.get("task_outcomes", [])),
                 "failures": list(payload.get("failures", [])),
                 "api_keys": dict(payload.get("api_keys", {})),
+                "routines": list(payload.get("routines", [])),
             }
         except (OSError, ValueError, TypeError):
-            return {"preferences": {}, "task_outcomes": [], "failures": [], "api_keys": {}}
+            return {
+                "preferences": {},
+                "task_outcomes": [],
+                "failures": [],
+                "api_keys": {},
+                "routines": [],
+            }
 
     def _save_memory(self) -> None:
         memory_path = self._memory_path()
@@ -2582,6 +2773,198 @@ class ChatWindow(QtWidgets.QWidget):
             self._memory["preferences"] = preferences
         preferences["batch_action_review_enabled"] = enabled
         self._save_memory()
+
+    def _load_dry_run_preference(self) -> None:
+        preferences = self._memory.get("preferences", {})
+        enabled = bool(preferences.get("dry_run_enabled", False))
+        self.controls_panel.dry_run_toggle.blockSignals(True)
+        self.controls_panel.dry_run_toggle.setChecked(enabled)
+        self.controls_panel.dry_run_toggle.blockSignals(False)
+        self.controls_panel._update_permission_summary()
+
+    def _persist_dry_run_preference(self, enabled: bool) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["dry_run_enabled"] = enabled
+        self._save_memory()
+
+    def _load_screenshot_context_preference(self) -> None:
+        preferences = self._memory.get("preferences", {})
+        enabled = bool(preferences.get("screenshot_context_enabled", False))
+        self.controls_panel.screenshot_context_toggle.blockSignals(True)
+        self.controls_panel.screenshot_context_toggle.setChecked(enabled)
+        self.controls_panel.screenshot_context_toggle.blockSignals(False)
+
+    def _persist_screenshot_context_preference(self, enabled: bool) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["screenshot_context_enabled"] = enabled
+        self._save_memory()
+
+    def _load_routines(self) -> None:
+        routines_raw = self._memory.get("routines", [])
+        routines: list[Routine] = []
+        if isinstance(routines_raw, list):
+            for item in routines_raw:
+                if isinstance(item, dict):
+                    routine = Routine.from_payload(item)
+                    if routine:
+                        routines.append(routine)
+        self._routines = routines
+        self.controls_panel.set_routines(self._routines)
+
+    def _save_routines(self) -> None:
+        self._memory["routines"] = [routine.to_payload() for routine in self._routines]
+        self._save_memory()
+        self.controls_panel.set_routines(self._routines)
+
+    def _handle_record_routine_toggle(self, active: bool) -> None:
+        self._recording_active = active
+        self.controls_panel.set_recording_state(active)
+        if active:
+            self._recording_actions = []
+            self.controls_panel.log("Routine recording started.")
+        else:
+            self.controls_panel.log(
+                f"Routine recording stopped. {len(self._recording_actions)} actions captured."
+            )
+
+    def _handle_manual_action(self, payload: dict) -> None:
+        if not self._recording_active:
+            return
+        action = payload.get("action")
+        parameters = payload.get("parameters")
+        if not isinstance(action, str) or not isinstance(parameters, dict):
+            return
+        self._recording_actions.append(
+            RoutineAction(action=action, parameters=parameters)
+        )
+        self.controls_panel.log(f"Recorded action: {self._format_action_summary(action, parameters)}")
+
+    def _save_recorded_routine(self) -> None:
+        if not self._recording_actions:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Save Routine",
+                "Record at least one manual action before saving.",
+            )
+            return
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Save Routine",
+            "Routine name",
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        existing_index = next(
+            (index for index, routine in enumerate(self._routines) if routine.name == name),
+            None,
+        )
+        if existing_index is not None:
+            response = QtWidgets.QMessageBox.question(
+                self,
+                "Save Routine",
+                f"Routine '{name}' already exists. Replace it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if response != QtWidgets.QMessageBox.Yes:
+                return
+        routine = Routine(
+            name=name,
+            actions=list(self._recording_actions),
+            created_at=datetime.now().isoformat(),
+        )
+        if existing_index is None:
+            self._routines.append(routine)
+        else:
+            self._routines[existing_index] = routine
+        self._save_routines()
+        self.controls_panel.log(f"Routine saved: {name} ({len(routine.actions)} actions).")
+
+    def _condition_allows(self, condition: Optional[str]) -> bool:
+        if not condition:
+            return True
+        normalized = condition.strip().lower()
+        context = {
+            "control_enabled": self.controls_panel.enable_control_toggle.isChecked(),
+            "dry_run": self.controls_panel.is_dry_run_enabled(),
+        }
+        if normalized == "control_enabled":
+            return context["control_enabled"]
+        if normalized == "control_disabled":
+            return not context["control_enabled"]
+        if normalized == "dry_run":
+            return context["dry_run"]
+        if normalized in {"not dry_run", "dry_run_disabled"}:
+            return not context["dry_run"]
+        self.controls_panel.log(f"Routine condition skipped: '{condition}' is not supported.")
+        return False
+
+    def _run_selected_routine(self) -> None:
+        routine_name = self.controls_panel.selected_routine_name()
+        if not routine_name:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Run Routine",
+                "Select a routine to run.",
+            )
+            return
+        routine = next((item for item in self._routines if item.name == routine_name), None)
+        if not routine:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Run Routine",
+                "Selected routine could not be found.",
+            )
+            return
+        self.controls_panel.log(f"Running routine: {routine.name}.")
+        self._append_audit_entry(
+            {"event": "routine_started", "name": routine.name, "actions": len(routine.actions)}
+        )
+        eligible_actions: list[RoutineAction] = []
+        summaries: list[str] = []
+        for action in routine.actions:
+            if not self._condition_allows(action.condition):
+                self.controls_panel.log(
+                    f"Skipping action due to condition: {action.action}"
+                )
+                continue
+            eligible_actions.append(action)
+            summary = self._format_action_summary(action.action, action.parameters)
+            if action.condition:
+                summary = f"{summary} (if {action.condition})"
+            summaries.append(summary)
+        if not eligible_actions:
+            self.controls_panel.log("Routine completed: no eligible actions to run.")
+            self._append_audit_entry(
+                {"event": "routine_completed", "name": routine.name, "actions_run": 0}
+            )
+            return
+        if (
+            len(eligible_actions) == 1
+            or not self.controls_panel.batch_review_toggle.isChecked()
+        ):
+            for action in eligible_actions:
+                self._dispatch_action(action.to_payload(), confirm=True)
+        else:
+            approved_indices = self._review_actions(summaries)
+            for index in approved_indices:
+                self._dispatch_action(eligible_actions[index].to_payload(), confirm=False)
+        self.controls_panel.log("Routine execution finished.")
+        self._append_audit_entry(
+            {
+                "event": "routine_completed",
+                "name": routine.name,
+                "actions_run": len(eligible_actions),
+            }
+        )
 
     def _optional_module(self, module_name: str):
         if importlib.util.find_spec(module_name) is None:
@@ -3073,6 +3456,17 @@ class ChatWindow(QtWidgets.QWidget):
                 }
             )
             return
+        if self.controls_panel.is_dry_run_enabled():
+            self.controls_panel.log(f"Dry run: action not executed ({summary}).")
+            self._append_audit_entry(
+                {
+                    "event": "control_action_dry_run",
+                    "action": action,
+                    "summary": summary,
+                    "parameters": parameters,
+                }
+            )
+            return
         if confirm:
             prompt = f"Execute action?\n\n{summary}"
             response = QtWidgets.QMessageBox.question(
@@ -3274,40 +3668,33 @@ class ChatWindow(QtWidgets.QWidget):
             f"Last error at {time_str}. Please try again shortly."
         )
 
-    def _generate_response(self) -> str:
-        provider = self._selected_provider()
-        if not provider:
-            return "Select a provider to start chatting."
-        model_id = self._selected_model_id()
+    def _request_model_response(
+        self,
+        provider: str,
+        model_id: str,
+        system_message: str,
+        messages: list[dict[str, str]],
+        messages_without_system: list[dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[bool, str]:
         provider_info = PROVIDER_REGISTRY[provider]
         env_key = provider_info["env_key"]
-        behavior = self._behavior_preferences()
-        system_message = (
-            "You are {persona}. Respond in a {tone} tone. "
-            "When you want to request a desktop automation action, include a JSON snippet "
-            "wrapped in a ```json code fence after your response. "
-            "Use the format: {\"action\": \"move_mouse|click_mouse|type_text|press_key\", "
-            "\"parameters\": {\"x\": 0, \"y\": 0}}. "
-            "Use parameters appropriate to the action: move_mouse(x, y, duration), "
-            "click_mouse(button, clicks, interval), type_text(text), press_key(key). "
-            "You may include multiple actions by returning multiple JSON blocks or a single "
-            "{\"actions\": [...]} block. Only use valid JSON."
-        ).format(persona=behavior["persona"], tone=behavior["tone"])
-        messages = [{"role": "system", "content": system_message}]
-        messages.extend(self.chat_model.as_openai_messages())
-        temperature = float(behavior["temperature"])
-        max_tokens = int(behavior["max_tokens"])
 
         if provider in {"openai", "deepseek", "groq", "mistral", "perplexity"}:
             if openai is None:
                 return (
+                    False,
                     "I'm ready to help. Install the OpenAI SDK to enable "
-                    "live model responses."
+                    "live model responses.",
                 )
             self._maybe_prompt_api_key()
             api_key = os.getenv(env_key)
             if not api_key:
-                return f"Set {env_key} to enable {provider_info['label']} responses."
+                return (
+                    False,
+                    f"Set {env_key} to enable {provider_info['label']} responses.",
+                )
             client_kwargs = {"api_key": api_key}
             base_url = provider_info.get("base_url")
             if base_url:
@@ -3323,25 +3710,28 @@ class ChatWindow(QtWidgets.QWidget):
                         max_tokens=max_tokens,
                     ).choices[0].message.content,
                 )
-                self._dispatch_actions(response)
-                return response
+                return True, response
             except Exception:  # pragma: no cover - network call
                 self._set_provider_health(
                     provider,
                     ProviderHealthState.ERROR,
                     error_message=self._friendly_api_status(provider),
                 )
-                return self._friendly_api_error(provider)
+                return False, self._friendly_api_error(provider)
 
         if provider == "anthropic":
             if anthropic is None:
                 return (
+                    False,
                     "I'm ready to help. Install the Anthropic SDK to enable "
-                    "live model responses."
+                    "live model responses.",
                 )
             self._maybe_prompt_api_key()
             if not os.getenv(env_key):
-                return f"Set {env_key} to enable {provider_info['label']} responses."
+                return (
+                    False,
+                    f"Set {env_key} to enable {provider_info['label']} responses.",
+                )
             client = anthropic.Anthropic(api_key=os.getenv(env_key))
             try:
                 def _anthropic_call() -> str:
@@ -3350,7 +3740,7 @@ class ChatWindow(QtWidgets.QWidget):
                         max_tokens=max_tokens,
                         temperature=temperature,
                         system=system_message,
-                        messages=self.chat_model.as_openai_messages(),
+                        messages=messages_without_system,
                     )
                     if response.content:
                         return response.content[0].text
@@ -3358,27 +3748,30 @@ class ChatWindow(QtWidgets.QWidget):
 
                 content = self._call_with_retries(provider, _anthropic_call)
                 if content:
-                    self._dispatch_actions(content)
-                    return content
-                return "No response content returned from Anthropic."
+                    return True, content
+                return True, "No response content returned from Anthropic."
             except Exception:  # pragma: no cover - network call
                 self._set_provider_health(
                     provider,
                     ProviderHealthState.ERROR,
                     error_message=self._friendly_api_status(provider),
                 )
-                return self._friendly_api_error(provider)
+                return False, self._friendly_api_error(provider)
 
         if provider == "gemini":
             self._maybe_prompt_api_key()
             api_key = os.getenv(env_key)
             if not api_key:
-                return f"Set {env_key} to enable {provider_info['label']} responses."
+                return (
+                    False,
+                    f"Set {env_key} to enable {provider_info['label']} responses.",
+                )
             genai = self._optional_module("google.generativeai")
             if genai is None:
                 return (
+                    False,
                     "Install the Google Generative AI SDK (google-generativeai) "
-                    "to enable Gemini responses."
+                    "to enable Gemini responses.",
                 )
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_id)
@@ -3392,25 +3785,28 @@ class ChatWindow(QtWidgets.QWidget):
                     lambda: model.generate_content(prompt).text
                     or "No response content returned from Gemini.",
                 )
-                self._dispatch_actions(content)
-                return content
+                return True, content
             except Exception:  # pragma: no cover - network call
                 self._set_provider_health(
                     provider,
                     ProviderHealthState.ERROR,
                     error_message=self._friendly_api_status(provider),
                 )
-                return self._friendly_api_error(provider)
+                return False, self._friendly_api_error(provider)
 
         if provider == "cohere":
             self._maybe_prompt_api_key()
             api_key = os.getenv(env_key)
             if not api_key:
-                return f"Set {env_key} to enable {provider_info['label']} responses."
+                return (
+                    False,
+                    f"Set {env_key} to enable {provider_info['label']} responses.",
+                )
             cohere = self._optional_module("cohere")
             if cohere is None:
                 return (
-                    "Install the Cohere SDK (cohere) to enable Cohere responses."
+                    False,
+                    "Install the Cohere SDK (cohere) to enable Cohere responses.",
                 )
             client = cohere.Client(api_key)
             prompt = "\n".join(
@@ -3423,17 +3819,145 @@ class ChatWindow(QtWidgets.QWidget):
                     lambda: client.chat(model=model_id, message=prompt).text
                     or "No response content returned from Cohere.",
                 )
-                self._dispatch_actions(content)
-                return content
+                return True, content
             except Exception:  # pragma: no cover - network call
                 self._set_provider_health(
                     provider,
                     ProviderHealthState.ERROR,
                     error_message=self._friendly_api_status(provider),
                 )
-                return self._friendly_api_error(provider)
+                return False, self._friendly_api_error(provider)
 
-        return f"No client available for provider '{provider}'."
+        return False, f"No client available for provider '{provider}'."
+
+    def _capture_screenshot_context(self) -> Optional[dict[str, object]]:
+        if pyautogui is None:
+            self.controls_panel.log("Screenshot context skipped: pyautogui unavailable.")
+            return None
+        try:
+            snapshot = pyautogui.screenshot()
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.controls_panel.log(f"Screenshot capture failed: {exc}")
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_dir = Path.home() / ".kaligpt" / "snapshots"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"snapshot_{timestamp}.png"
+        try:
+            snapshot.save(snapshot_path)
+        except Exception as exc:  # pragma: no cover - environment dependent
+            self.controls_panel.log(f"Snapshot save failed: {exc}")
+            return None
+        self.controls_panel.log(f"Captured screenshot for context: {snapshot_path}")
+        return {
+            "path": str(snapshot_path),
+            "width": snapshot.width,
+            "height": snapshot.height,
+            "timestamp": timestamp,
+        }
+
+    def _run_screenshot_analysis(
+        self,
+        provider: str,
+        model_id: str,
+        temperature: float,
+        max_tokens: int,
+        chat_messages: list[dict[str, str]],
+    ) -> Optional[str]:
+        if not self.controls_panel.is_screenshot_context_enabled():
+            return None
+        context = self._capture_screenshot_context()
+        if not context:
+            return None
+        analysis_system = (
+            "You are analyzing a desktop screenshot for an automation assistant. "
+            "Summarize the visible UI, active application cues, and anything that "
+            "matters for the next action. Do not include JSON action blocks."
+        )
+        last_user = next(
+            (msg["content"] for msg in reversed(chat_messages) if msg.get("role") == "user"),
+            "",
+        )
+        user_lines = [
+            "Screenshot metadata:",
+            f"- path: {context['path']}",
+            f"- size: {context['width']}x{context['height']}",
+            f"- captured: {context['timestamp']}",
+        ]
+        if last_user:
+            user_lines.append(f"User goal: {last_user}")
+        user_message = "\n".join(user_lines)
+        analysis_messages = [
+            {"role": "system", "content": analysis_system},
+            {"role": "user", "content": user_message},
+        ]
+        analysis_messages_without_system = [
+            {"role": "user", "content": user_message}
+        ]
+        success, analysis = self._request_model_response(
+            provider,
+            model_id,
+            analysis_system,
+            analysis_messages,
+            analysis_messages_without_system,
+            temperature,
+            max_tokens,
+        )
+        if not success:
+            self.controls_panel.log("Screenshot analysis skipped: model unavailable.")
+            return None
+        self.controls_panel.log("Screenshot analysis completed.")
+        return analysis.strip() if analysis else None
+
+    def _generate_response(self) -> str:
+        provider = self._selected_provider()
+        if not provider:
+            return "Select a provider to start chatting."
+        model_id = self._selected_model_id()
+        behavior = self._behavior_preferences()
+        system_message = (
+            "You are {persona}. Respond in a {tone} tone. "
+            "When you want to request a desktop automation action, include a JSON snippet "
+            "wrapped in a ```json code fence after your response. "
+            "Use the format: {\"action\": \"move_mouse|click_mouse|type_text|press_key\", "
+            "\"parameters\": {\"x\": 0, \"y\": 0}}. "
+            "Use parameters appropriate to the action: move_mouse(x, y, duration), "
+            "click_mouse(button, clicks, interval), type_text(text), press_key(key). "
+            "You may include multiple actions by returning multiple JSON blocks or a single "
+            "{\"actions\": [...]} block. Only use valid JSON."
+        ).format(persona=behavior["persona"], tone=behavior["tone"])
+        chat_messages = self.chat_model.as_openai_messages()
+        messages = [{"role": "system", "content": system_message}]
+        analysis_context = self._run_screenshot_analysis(
+            provider,
+            model_id,
+            temperature=0.2,
+            max_tokens=min(512, int(behavior["max_tokens"])),
+            chat_messages=chat_messages,
+        )
+        if analysis_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Screenshot analysis context:\n{analysis_context}",
+                }
+            )
+        messages.extend(chat_messages)
+        temperature = float(behavior["temperature"])
+        max_tokens = int(behavior["max_tokens"])
+
+        success, response = self._request_model_response(
+            provider,
+            model_id,
+            system_message,
+            messages,
+            chat_messages,
+            temperature,
+            max_tokens,
+        )
+        if success:
+            self._dispatch_actions(response)
+        return response
 
 
 def main() -> int:

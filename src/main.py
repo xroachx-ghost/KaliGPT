@@ -435,14 +435,31 @@ class TaskModel(QtCore.QAbstractTableModel):
 class ComputerControlPanel(QtWidgets.QGroupBox):
     screenshot_captured = QtCore.Signal(QtGui.QPixmap)
     preview_interval_ms = 1000
+    AUTOMATION_UNAVAILABLE_MESSAGE = (
+        "Automation unavailable. Install pyautogui and grant OS accessibility permissions "
+        "to enable desktop control."
+    )
+    AUTOMATION_UNAVAILABLE_TOOLTIP = (
+        "Desktop control requires pyautogui.\n"
+        "Install it with: pip install pyautogui\n"
+        "Then grant accessibility/automation permissions in your OS settings."
+    )
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__("Computer Control", parent)
         self._agent_mode_active = False
         self._emergency_stopped = False
+        self._automation_message_logged = False
 
         self.status_label = QtWidgets.QLabel("Control disabled.")
         self.status_label.setWordWrap(True)
+
+        self.automation_banner = QtWidgets.QLabel(self.AUTOMATION_UNAVAILABLE_MESSAGE)
+        self.automation_banner.setWordWrap(True)
+        self.automation_banner.setStyleSheet(
+            "background: #3b2f1b; color: #f6d26b; border-radius: 6px; padding: 6px;"
+        )
+        self.automation_banner.setVisible(False)
 
         self.enable_control_toggle = QtWidgets.QCheckBox("Enable Control")
         self.enable_control_toggle.toggled.connect(self.handle_control_toggle)
@@ -583,6 +600,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.automation_banner)
         layout.addWidget(self.enable_control_toggle)
         control_row = QtWidgets.QHBoxLayout()
         control_row.addWidget(self.emergency_stop_button)
@@ -595,9 +613,11 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.manual_controls_group)
         layout.addWidget(self.activity_log)
         self.screenshot_captured.connect(self.update_preview)
+        self._update_automation_availability(log_message=True)
 
     def set_agent_mode(self, active: bool) -> None:
         self._agent_mode_active = active
+        self._update_automation_availability(log_message=active)
         if not active:
             self.preview_timer.stop()
             self.preview_toggle_button.blockSignals(True)
@@ -606,14 +626,21 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.preview_toggle_button.blockSignals(False)
             self.preview_toggle_button.setEnabled(False)
         else:
-            self.preview_toggle_button.setEnabled(True)
-            self._update_preview_loop()
+            if pyautogui is not None:
+                self.preview_toggle_button.setEnabled(True)
+                self._update_preview_loop()
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.activity_log.appendPlainText(f"[{timestamp}] {message}")
 
     def handle_control_toggle(self, enabled: bool) -> None:
+        if pyautogui is None:
+            self.enable_control_toggle.blockSignals(True)
+            self.enable_control_toggle.setChecked(False)
+            self.enable_control_toggle.blockSignals(False)
+            self._note_automation_unavailable()
+            return
         if self._emergency_stopped:
             self.enable_control_toggle.blockSignals(True)
             self.enable_control_toggle.setChecked(False)
@@ -631,11 +658,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
 
     def handle_screenshot(self) -> None:
         if pyautogui is None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Missing dependency",
-                "pyautogui is not installed. Install it to capture screenshots.",
-            )
+            self._note_automation_unavailable()
             return
         self.log("Capturing screenshot...")
         screenshot = pyautogui.screenshot()
@@ -656,7 +679,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.preview_timer.stop()
             self.preview_toggle_button.setChecked(True)
             self.screenshot_label.setText("Preview unavailable")
-            self.log("Preview stopped: pyautogui is not installed.")
+            self._note_automation_unavailable()
             return
         screenshot = pyautogui.screenshot()
         pixmap = self._pixmap_from_screenshot(screenshot)
@@ -690,6 +713,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         )
         if should_run and pyautogui is None:
             self.preview_toggle_button.setChecked(True)
+            self._note_automation_unavailable()
             return
         if should_run and not self.preview_timer.isActive():
             self.preview_timer.start()
@@ -721,7 +745,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
 
     def _control_allowed(self, action_label: str) -> bool:
         if pyautogui is None:
-            self.log(f"{action_label} blocked: pyautogui is not installed.")
+            self._note_automation_unavailable()
             return False
         if self._emergency_stopped:
             self.log(f"{action_label} blocked: emergency stop is active.")
@@ -730,6 +754,36 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.log(f"{action_label} blocked: control is disabled.")
             return False
         return True
+
+    def _note_automation_unavailable(self) -> None:
+        self.status_label.setText(self.AUTOMATION_UNAVAILABLE_MESSAGE)
+        if not self._automation_message_logged:
+            self.log(self.AUTOMATION_UNAVAILABLE_MESSAGE)
+            self._automation_message_logged = True
+
+    def _update_automation_availability(self, log_message: bool = False) -> None:
+        unavailable = pyautogui is None
+        self.automation_banner.setVisible(unavailable)
+        if unavailable:
+            if log_message:
+                self._note_automation_unavailable()
+            self.take_screenshot_button.setEnabled(False)
+            self.preview_toggle_button.setEnabled(False)
+            self.manual_controls_group.setEnabled(False)
+            self.enable_control_toggle.setToolTip(self.AUTOMATION_UNAVAILABLE_TOOLTIP)
+            self.take_screenshot_button.setToolTip(self.AUTOMATION_UNAVAILABLE_TOOLTIP)
+            self.preview_toggle_button.setToolTip(self.AUTOMATION_UNAVAILABLE_TOOLTIP)
+            self.manual_controls_group.setToolTip(self.AUTOMATION_UNAVAILABLE_TOOLTIP)
+            self.screenshot_label.setText("Preview unavailable")
+        else:
+            self.automation_banner.setVisible(False)
+            self.take_screenshot_button.setEnabled(True)
+            self.manual_controls_group.setEnabled(True)
+            self.preview_toggle_button.setEnabled(self._agent_mode_active)
+            self.enable_control_toggle.setToolTip("")
+            self.take_screenshot_button.setToolTip("")
+            self.preview_toggle_button.setToolTip("")
+            self.manual_controls_group.setToolTip("")
 
     def _action_delay_seconds(self) -> float:
         minimum = self.delay_min_spin.value()

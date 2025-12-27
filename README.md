@@ -27,3 +27,9 @@ python src/main.py
   credentials are not provided.
 - If no API key is configured for the selected provider, the header shows a
   “Demo mode: API key missing” banner to indicate stubbed responses.
+
+## Troubleshooting
+
+- **Automation unavailable banner**: install `pyautogui` (`pip install pyautogui`) and
+  enable accessibility/automation permissions for your OS (macOS may also require Screen
+  Recording permissions) before restarting the app.

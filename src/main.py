@@ -33,6 +33,20 @@ class ChatMessage:
         return f"[{time_str}] {self.role.title()}: {self.content}"
 
 
+@dataclass
+class Task:
+    title: str
+    completed: bool = False
+
+    def to_payload(self) -> dict[str, str | bool]:
+        return {"title": self.title, "completed": self.completed}
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "Task":
+        title = str(payload.get("title", "")).strip()
+        return cls(title=title, completed=bool(payload.get("completed", False)))
+
+
 class ChatModel(QtCore.QAbstractListModel):
     def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
         super().__init__(parent)
@@ -60,6 +74,134 @@ class ChatModel(QtCore.QAbstractListModel):
 
     def as_openai_messages(self) -> list[dict[str, str]]:
         return [{"role": msg.role, "content": msg.content} for msg in self._messages]
+
+
+class TaskModel(QtCore.QAbstractTableModel):
+    tasks_changed = QtCore.Signal()
+    _headers = ("Done", "Task")
+
+    def __init__(self, parent: Optional[QtCore.QObject] = None) -> None:
+        super().__init__(parent)
+        self._tasks: list[Task] = []
+
+    def rowCount(self, parent: QtCore.QModelIndex = QtCore.QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._tasks)
+
+    def columnCount(self, parent: QtCore.QModelIndex = QtCore.QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._headers)
+
+    def headerData(
+        self,
+        section: int,
+        orientation: QtCore.Qt.Orientation,
+        role: int = QtCore.Qt.DisplayRole,
+    ):
+        if role != QtCore.Qt.DisplayRole or orientation != QtCore.Qt.Horizontal:
+            return None
+        if 0 <= section < len(self._headers):
+            return self._headers[section]
+        return None
+
+    def data(self, index: QtCore.QModelIndex, role: int = QtCore.Qt.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._tasks)):
+            return None
+        task = self._tasks[index.row()]
+        if index.column() == 0 and role == QtCore.Qt.CheckStateRole:
+            return QtCore.Qt.Checked if task.completed else QtCore.Qt.Unchecked
+        if index.column() == 1 and role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+            return task.title
+        if role == QtCore.Qt.UserRole:
+            return task
+        return None
+
+    def flags(self, index: QtCore.QModelIndex) -> QtCore.Qt.ItemFlags:
+        if not index.isValid():
+            return QtCore.Qt.ItemIsEnabled
+        flags = QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
+        if index.column() == 0:
+            flags |= QtCore.Qt.ItemIsUserCheckable
+        return flags
+
+    def setData(self, index: QtCore.QModelIndex, value, role: int = QtCore.Qt.EditRole) -> bool:
+        if not index.isValid() or not (0 <= index.row() < len(self._tasks)):
+            return False
+        task = self._tasks[index.row()]
+        updated = False
+        if index.column() == 0 and role == QtCore.Qt.CheckStateRole:
+            task.completed = value == QtCore.Qt.Checked
+            updated = True
+        elif index.column() == 1 and role == QtCore.Qt.EditRole:
+            title = str(value).strip()
+            if title:
+                task.title = title
+                updated = True
+        if updated:
+            self.dataChanged.emit(index, index, [role])
+            self.tasks_changed.emit()
+        return updated
+
+    def add_task(self, title: str) -> None:
+        title = title.strip()
+        if not title:
+            return
+        self.beginInsertRows(QtCore.QModelIndex(), len(self._tasks), len(self._tasks))
+        self._tasks.append(Task(title=title))
+        self.endInsertRows()
+        self.tasks_changed.emit()
+
+    def update_task(self, row: int, title: str) -> None:
+        if not (0 <= row < len(self._tasks)):
+            return
+        title = title.strip()
+        if not title:
+            return
+        self._tasks[row].title = title
+        index = self.index(row, 1)
+        self.dataChanged.emit(index, index, [QtCore.Qt.DisplayRole, QtCore.Qt.EditRole])
+        self.tasks_changed.emit()
+
+    def toggle_complete(self, row: int) -> None:
+        if not (0 <= row < len(self._tasks)):
+            return
+        self._tasks[row].completed = not self._tasks[row].completed
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [QtCore.Qt.CheckStateRole])
+        self.tasks_changed.emit()
+
+    def remove_task(self, row: int) -> None:
+        if not (0 <= row < len(self._tasks)):
+            return
+        self.beginRemoveRows(QtCore.QModelIndex(), row, row)
+        self._tasks.pop(row)
+        self.endRemoveRows()
+        self.tasks_changed.emit()
+
+    def move_task(self, source_row: int, target_row: int) -> None:
+        if not (0 <= source_row < len(self._tasks)):
+            return
+        if not (0 <= target_row < len(self._tasks)):
+            return
+        if source_row == target_row:
+            return
+        destination = target_row + (1 if target_row > source_row else 0)
+        self.beginMoveRows(QtCore.QModelIndex(), source_row, source_row, QtCore.QModelIndex(), destination)
+        task = self._tasks.pop(source_row)
+        self._tasks.insert(target_row, task)
+        self.endMoveRows()
+        self.tasks_changed.emit()
+
+    def set_tasks(self, tasks: list[Task]) -> None:
+        self.beginResetModel()
+        self._tasks = list(tasks)
+        self.endResetModel()
+        self.tasks_changed.emit()
+
+    def tasks(self) -> list[Task]:
+        return list(self._tasks)
 
 
 class ComputerControlPanel(QtWidgets.QGroupBox):
@@ -352,6 +494,8 @@ class ChatWindow(QtWidgets.QWidget):
         self.resize(1200, 720)
 
         self.chat_model = ChatModel(self)
+        self.task_model = TaskModel(self)
+        self.task_model.tasks_changed.connect(self._save_tasks)
         self.chat_view = QtWidgets.QListView()
         self.chat_view.setModel(self.chat_model)
         self.chat_view.setWordWrap(True)
@@ -369,6 +513,40 @@ class ChatWindow(QtWidgets.QWidget):
         self.send_button.clicked.connect(self.handle_send)
 
         self.controls_panel = ComputerControlPanel()
+        self.task_panel = QtWidgets.QGroupBox("Tasks")
+        self.task_view = QtWidgets.QTableView()
+        self.task_view.setModel(self.task_model)
+        self.task_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.task_view.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.task_view.setEditTriggers(QtWidgets.QAbstractItemView.SelectedClicked)
+        self.task_view.verticalHeader().setVisible(False)
+        self.task_view.horizontalHeader().setStretchLastSection(True)
+        self.task_view.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.task_view.setAlternatingRowColors(True)
+
+        self.add_task_button = QtWidgets.QPushButton("Add")
+        self.add_task_button.clicked.connect(self._add_task)
+        self.edit_task_button = QtWidgets.QPushButton("Edit")
+        self.edit_task_button.clicked.connect(self._edit_task)
+        self.remove_task_button = QtWidgets.QPushButton("Remove")
+        self.remove_task_button.clicked.connect(self._remove_task)
+        self.move_up_button = QtWidgets.QPushButton("Move Up")
+        self.move_up_button.clicked.connect(lambda: self._move_task(-1))
+        self.move_down_button = QtWidgets.QPushButton("Move Down")
+        self.move_down_button.clicked.connect(lambda: self._move_task(1))
+        self.complete_task_button = QtWidgets.QPushButton("Toggle Complete")
+        self.complete_task_button.clicked.connect(self._toggle_complete)
+
+        self.agent_toggle_button = QtWidgets.QPushButton("Start Agent Loop")
+        self.agent_toggle_button.setCheckable(True)
+        self.agent_toggle_button.toggled.connect(self._toggle_agent_loop)
+
+        self.agent_timer = QtCore.QTimer(self)
+        self.agent_timer.setInterval(2500)
+        self.agent_timer.timeout.connect(self._run_agent_step)
+        self._agent_step_count = 0
 
         self.api_status = QtWidgets.QLabel()
         self.api_status.setText(self._api_status_text())
@@ -397,13 +575,39 @@ class ChatWindow(QtWidgets.QWidget):
         chat_layout.addLayout(input_layout)
         chat_layout.addWidget(self.api_status)
 
+        task_button_layout = QtWidgets.QGridLayout()
+        task_button_layout.addWidget(self.add_task_button, 0, 0)
+        task_button_layout.addWidget(self.edit_task_button, 0, 1)
+        task_button_layout.addWidget(self.remove_task_button, 0, 2)
+        task_button_layout.addWidget(self.move_up_button, 1, 0)
+        task_button_layout.addWidget(self.move_down_button, 1, 1)
+        task_button_layout.addWidget(self.complete_task_button, 1, 2)
+
+        task_layout = QtWidgets.QVBoxLayout(self.task_panel)
+        task_layout.addWidget(self.task_view)
+        task_layout.addLayout(task_button_layout)
+        task_layout.addWidget(self.agent_toggle_button)
+
+        right_layout = QtWidgets.QVBoxLayout()
+        right_layout.addWidget(self.task_panel)
+        right_layout.addWidget(self.controls_panel)
+        right_layout.addStretch()
+
+        right_widget = QtWidgets.QWidget()
+        right_widget.setLayout(right_layout)
+
         main_layout = QtWidgets.QHBoxLayout(self)
         main_layout.addLayout(chat_layout, stretch=3)
-        main_layout.addWidget(self.controls_panel, stretch=2)
+        main_layout.addWidget(right_widget, stretch=2)
 
         self._apply_theme()
         self._configure_mode()
         self._load_history()
+        self._load_tasks()
+        self._refresh_task_controls()
+        self.task_view.selectionModel().selectionChanged.connect(
+            lambda *_: self._refresh_task_controls()
+        )
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -464,6 +668,19 @@ class ChatWindow(QtWidgets.QWidget):
                 color: #9aa0a6;
                 font-size: 13px;
             }
+            QTableView {
+                background: #202123;
+                border: 1px solid #3e3f4b;
+                border-radius: 8px;
+                gridline-color: #3e3f4b;
+            }
+            QHeaderView::section {
+                background: #2b2c2f;
+                color: #e8e8e8;
+                padding: 6px;
+                border: none;
+                font-weight: 600;
+            }
             """
         )
 
@@ -474,6 +691,10 @@ class ChatWindow(QtWidgets.QWidget):
         self.controls_panel.set_agent_mode(is_agent_mode)
         if not is_agent_mode:
             self.controls_panel.setChecked(False)
+            self.agent_toggle_button.setChecked(False)
+            self.agent_toggle_button.setEnabled(False)
+        else:
+            self.agent_toggle_button.setEnabled(True)
 
     def _api_status_text(self) -> str:
         if openai is None:
@@ -516,8 +737,123 @@ class ChatWindow(QtWidgets.QWidget):
     def _history_path(self) -> Path:
         return Path.home() / ".kaligpt" / "history.json"
 
+    def _tasks_path(self) -> Path:
+        return Path.home() / ".kaligpt" / "tasks.json"
+
+    def _load_tasks(self) -> None:
+        tasks_path = self._tasks_path()
+        if not tasks_path.exists():
+            return
+        try:
+            with tasks_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            tasks: list[Task] = []
+            for item in payload:
+                task = Task.from_payload(item)
+                if task.title:
+                    tasks.append(task)
+            self.task_model.set_tasks(tasks)
+        except (OSError, ValueError, TypeError):
+            return
+
+    def _save_tasks(self) -> None:
+        tasks_path = self._tasks_path()
+        tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [task.to_payload() for task in self.task_model.tasks()]
+        with tasks_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def _selected_task_row(self) -> int | None:
+        selection = self.task_view.selectionModel()
+        if selection is None:
+            return None
+        indexes = selection.selectedRows()
+        if not indexes:
+            return None
+        return indexes[0].row()
+
+    def _refresh_task_controls(self) -> None:
+        row = self._selected_task_row()
+        has_row = row is not None
+        self.edit_task_button.setEnabled(has_row)
+        self.remove_task_button.setEnabled(has_row)
+        self.move_up_button.setEnabled(has_row and row > 0)
+        self.move_down_button.setEnabled(has_row and row is not None and row < self.task_model.rowCount() - 1)
+        self.complete_task_button.setEnabled(has_row)
+
+    def _add_task(self) -> None:
+        title, ok = QtWidgets.QInputDialog.getText(self, "Add Task", "Task")
+        if not ok:
+            return
+        self.task_model.add_task(title)
+        self.task_view.scrollToBottom()
+        self._refresh_task_controls()
+
+    def _edit_task(self) -> None:
+        row = self._selected_task_row()
+        if row is None:
+            return
+        task = self.task_model.tasks()[row]
+        title, ok = QtWidgets.QInputDialog.getText(
+            self, "Edit Task", "Task", text=task.title
+        )
+        if not ok:
+            return
+        self.task_model.update_task(row, title)
+        self._refresh_task_controls()
+
+    def _remove_task(self) -> None:
+        row = self._selected_task_row()
+        if row is None:
+            return
+        self.task_model.remove_task(row)
+        self._refresh_task_controls()
+
+    def _move_task(self, direction: int) -> None:
+        row = self._selected_task_row()
+        if row is None:
+            return
+        target = row + direction
+        if not (0 <= target < self.task_model.rowCount()):
+            return
+        self.task_model.move_task(row, target)
+        self.task_view.selectRow(target)
+        self._refresh_task_controls()
+
+    def _toggle_complete(self) -> None:
+        row = self._selected_task_row()
+        if row is None:
+            return
+        self.task_model.toggle_complete(row)
+        self._refresh_task_controls()
+
+    def _toggle_agent_loop(self, running: bool) -> None:
+        if running:
+            self._agent_step_count = 0
+            self.agent_toggle_button.setText("Stop Agent Loop")
+            self.agent_timer.start()
+            self.controls_panel.log("Agent loop started.")
+        else:
+            self.agent_toggle_button.setText("Start Agent Loop")
+            self.agent_timer.stop()
+            self.controls_panel.log("Agent loop stopped.")
+
+    def _run_agent_step(self) -> None:
+        tasks = self.task_model.tasks()
+        pending = [task for task in tasks if not task.completed]
+        self._agent_step_count += 1
+        if not pending:
+            self.controls_panel.log("Agent loop idle: no pending tasks.")
+            self.agent_toggle_button.setChecked(False)
+            return
+        current_task = pending[0]
+        self.controls_panel.log(
+            f"Agent step {self._agent_step_count}: focusing on '{current_task.title}'."
+        )
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._save_history()
+        self._save_tasks()
         super().closeEvent(event)
 
     def handle_send(self) -> None:

@@ -838,6 +838,13 @@ class ModeSelectionDialog(QtWidgets.QDialog):
 
 
 class ChatWindow(QtWidgets.QWidget):
+    DEFAULT_PREFERENCES = {
+        "persona": "General assistant",
+        "tone": "Neutral",
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    }
+
     def __init__(self, mode: str) -> None:
         super().__init__()
         self.mode = mode
@@ -874,6 +881,43 @@ class ChatWindow(QtWidgets.QWidget):
         self.model_selector = QtWidgets.QComboBox()
         self.model_selector.currentIndexChanged.connect(self._handle_model_change)
         self._populate_provider_selector()
+
+        self.behavior_group = QtWidgets.QGroupBox("Behavior")
+        self.persona_input = QtWidgets.QLineEdit()
+        self.persona_input.setPlaceholderText("e.g., Security analyst or Red team coach")
+        self.persona_input.textChanged.connect(self._persist_behavior_preferences)
+
+        self.tone_selector = QtWidgets.QComboBox()
+        self.tone_selector.addItems(
+            [
+                "Neutral",
+                "Friendly",
+                "Direct",
+                "Formal",
+                "Concise",
+                "Analytical",
+                "Supportive",
+            ]
+        )
+        self.tone_selector.currentIndexChanged.connect(self._persist_behavior_preferences)
+
+        self.temperature_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.temperature_slider.setRange(0, 100)
+        self.temperature_slider.setSingleStep(1)
+        self.temperature_slider.valueChanged.connect(self._handle_temperature_change)
+        self.temperature_value_label = QtWidgets.QLabel()
+
+        self.max_tokens_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.max_tokens_slider.setRange(256, 4096)
+        self.max_tokens_slider.setSingleStep(64)
+        self.max_tokens_slider.valueChanged.connect(self._handle_max_tokens_change)
+        self.max_tokens_value_label = QtWidgets.QLabel()
+
+        behavior_form = QtWidgets.QFormLayout(self.behavior_group)
+        behavior_form.addRow("Persona", self.persona_input)
+        behavior_form.addRow("Tone", self.tone_selector)
+        behavior_form.addRow("Temperature", self._build_slider_row(self.temperature_slider, self.temperature_value_label))
+        behavior_form.addRow("Max tokens", self._build_slider_row(self.max_tokens_slider, self.max_tokens_value_label))
 
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.clicked.connect(self.handle_send)
@@ -954,6 +998,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         chat_layout.addLayout(input_layout)
         chat_layout.addLayout(model_layout)
+        chat_layout.addWidget(self.behavior_group)
         chat_layout.addWidget(self.api_status)
 
         task_button_layout = QtWidgets.QGridLayout()
@@ -983,6 +1028,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         self._apply_theme()
         self._configure_mode()
+        self._load_behavior_preferences()
         self._load_history()
         self._load_tasks()
         self._refresh_task_snapshot()
@@ -1287,19 +1333,122 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _summarize_preferences(self) -> str:
         preferences = self._memory.get("preferences", {})
-        if not isinstance(preferences, dict) or not preferences:
-            return "Preferences: none saved"
+        if not isinstance(preferences, dict):
+            preferences = {}
         provider = preferences.get("provider")
         model_map = preferences.get("model_map")
         model = None
         if isinstance(model_map, dict) and provider in model_map:
             model = model_map.get(provider)
+        behavior = self._behavior_preferences()
+        persona = behavior["persona"]
+        tone = behavior["tone"]
+        temperature = behavior["temperature"]
+        max_tokens = behavior["max_tokens"]
         if provider and model:
-            return f"Preferences: provider={provider}, model={model}"
-        return f"Preferences: provider={provider or 'none'}"
+            return (
+                "Preferences: "
+                f"provider={provider}, model={model}, persona={persona}, tone={tone}, "
+                f"temp={temperature}, max_tokens={max_tokens}"
+            )
+        return (
+            "Preferences: "
+            f"provider={provider or 'none'}, persona={persona}, tone={tone}, "
+            f"temp={temperature}, max_tokens={max_tokens}"
+        )
 
     def _update_preferences_label(self) -> None:
         self.preferences_label.setText(self._summarize_preferences())
+
+    def _behavior_preferences(self) -> dict[str, object]:
+        preferences = self._memory.get("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+        temperature = self._coerce_float(
+            preferences.get("temperature"), self.DEFAULT_PREFERENCES["temperature"]
+        )
+        max_tokens = self._coerce_int(
+            preferences.get("max_tokens"), self.DEFAULT_PREFERENCES["max_tokens"]
+        )
+        return {
+            "persona": preferences.get("persona") or self.DEFAULT_PREFERENCES["persona"],
+            "tone": preferences.get("tone") or self.DEFAULT_PREFERENCES["tone"],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+    def _coerce_float(self, value: object, fallback: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _coerce_int(self, value: object, fallback: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _build_slider_row(
+        self, slider: QtWidgets.QSlider, label: QtWidgets.QLabel
+    ) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(slider, stretch=1)
+        layout.addWidget(label)
+        return row
+
+    def _load_behavior_preferences(self) -> None:
+        preferences = self._behavior_preferences()
+        self.persona_input.setText(str(preferences["persona"]))
+        tone = str(preferences["tone"])
+        tone_index = self.tone_selector.findText(tone)
+        if tone_index == -1:
+            self.tone_selector.addItem(tone)
+            tone_index = self.tone_selector.findText(tone)
+        self.tone_selector.setCurrentIndex(tone_index)
+        temperature = float(preferences["temperature"])
+        self.temperature_slider.setValue(int(round(temperature * 100)))
+        self._update_temperature_label(temperature)
+        max_tokens = int(preferences["max_tokens"])
+        self.max_tokens_slider.setValue(max_tokens)
+        self._update_max_tokens_label(max_tokens)
+
+    def _handle_temperature_change(self, value: int) -> None:
+        temperature = value / 100
+        self._update_temperature_label(temperature)
+        self._persist_behavior_preferences()
+
+    def _handle_max_tokens_change(self, value: int) -> None:
+        self._update_max_tokens_label(value)
+        self._persist_behavior_preferences()
+
+    def _update_temperature_label(self, temperature: float) -> None:
+        self.temperature_value_label.setText(f"{temperature:.2f}")
+
+    def _update_max_tokens_label(self, max_tokens: int) -> None:
+        self.max_tokens_value_label.setText(str(max_tokens))
+
+    def _persist_behavior_preferences(self) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        persona = self.persona_input.text().strip() or self.DEFAULT_PREFERENCES["persona"]
+        tone = self.tone_selector.currentText().strip() or self.DEFAULT_PREFERENCES["tone"]
+        temperature = self.temperature_slider.value() / 100
+        max_tokens = self.max_tokens_slider.value()
+        preferences.update(
+            {
+                "persona": persona,
+                "tone": tone,
+                "temperature": round(temperature, 2),
+                "max_tokens": max_tokens,
+            }
+        )
+        self._save_memory()
+        self._update_preferences_label()
 
     def _load_tasks(self) -> None:
         tasks_path = self._tasks_path()
@@ -1509,6 +1658,14 @@ class ChatWindow(QtWidgets.QWidget):
         model_id = self._selected_model_id()
         provider_info = PROVIDER_REGISTRY[provider]
         env_key = provider_info["env_key"]
+        behavior = self._behavior_preferences()
+        system_message = (
+            "You are {persona}. Respond in a {tone} tone."
+        ).format(persona=behavior["persona"], tone=behavior["tone"])
+        messages = [{"role": "system", "content": system_message}]
+        messages.extend(self.chat_model.as_openai_messages())
+        temperature = float(behavior["temperature"])
+        max_tokens = int(behavior["max_tokens"])
 
         if provider in {"openai", "deepseek", "groq", "mistral", "perplexity"}:
             if openai is None:
@@ -1528,7 +1685,9 @@ class ChatWindow(QtWidgets.QWidget):
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
-                    messages=self.chat_model.as_openai_messages(),
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                 )
                 return completion.choices[0].message.content
             except Exception as exc:  # pragma: no cover - network call
@@ -1547,7 +1706,9 @@ class ChatWindow(QtWidgets.QWidget):
             try:
                 response = client.messages.create(
                     model=model_id,
-                    max_tokens=1024,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system_message,
                     messages=self.chat_model.as_openai_messages(),
                 )
                 if response.content:
@@ -1571,7 +1732,7 @@ class ChatWindow(QtWidgets.QWidget):
             model = genai.GenerativeModel(model_id)
             prompt = "\n".join(
                 f"{msg['role']}: {msg['content']}"
-                for msg in self.chat_model.as_openai_messages()
+                for msg in messages
             )
             try:
                 response = model.generate_content(prompt)
@@ -1592,7 +1753,7 @@ class ChatWindow(QtWidgets.QWidget):
             client = cohere.Client(api_key)
             prompt = "\n".join(
                 f"{msg['role']}: {msg['content']}"
-                for msg in self.chat_model.as_openai_messages()
+                for msg in messages
             )
             try:
                 response = client.chat(model=model_id, message=prompt)

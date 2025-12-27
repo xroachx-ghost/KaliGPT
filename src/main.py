@@ -61,6 +61,7 @@ class AgentState(str, Enum):
 class AgentRunner(QtCore.QObject):
     state_changed = QtCore.Signal(str)
     log_message = QtCore.Signal(str)
+    task_completed = QtCore.Signal(str, int)
 
     def __init__(
         self,
@@ -152,6 +153,7 @@ class AgentRunner(QtCore.QObject):
         self.log_message.emit(
             f"Agent step {self._step_count}: focusing on '{task.title}'."
         )
+        self.task_completed.emit(task.title, self._step_count)
 
     def _handle_step_error(self, exc: Exception) -> None:
         self._retry_count += 1
@@ -764,6 +766,8 @@ class ChatWindow(QtWidgets.QWidget):
         self.setWindowTitle("KaliGPT Workstation")
         self.resize(1200, 720)
 
+        self._memory = self._load_memory()
+
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
         self.task_model.tasks_changed.connect(self._save_tasks)
@@ -821,6 +825,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._agent_runner.moveToThread(self._agent_thread)
         self._agent_runner.log_message.connect(self.controls_panel.log)
         self._agent_runner.state_changed.connect(self._handle_agent_state)
+        self._agent_runner.task_completed.connect(self._prompt_task_feedback)
         self._agent_thread.start()
 
         self.api_status = QtWidgets.QLabel()
@@ -831,10 +836,14 @@ class ChatWindow(QtWidgets.QWidget):
         header_title.setObjectName("HeaderTitle")
         header_subtitle = QtWidgets.QLabel("Your AI assistant for secure workflows")
         header_subtitle.setObjectName("HeaderSubtitle")
+        self.preferences_label = QtWidgets.QLabel()
+        self.preferences_label.setObjectName("HeaderPreferences")
+        self._update_preferences_label()
 
         header_layout = QtWidgets.QVBoxLayout()
         header_layout.addWidget(header_title)
         header_layout.addWidget(header_subtitle)
+        header_layout.addWidget(self.preferences_label)
         header_layout.setSpacing(2)
 
         header_widget = QtWidgets.QWidget()
@@ -944,6 +953,10 @@ class ChatWindow(QtWidgets.QWidget):
                 color: #9aa0a6;
                 font-size: 13px;
             }
+            QLabel#HeaderPreferences {
+                color: #9aa0a6;
+                font-size: 12px;
+            }
             QTableView {
                 background: #202123;
                 border: 1px solid #3e3f4b;
@@ -1013,8 +1026,44 @@ class ChatWindow(QtWidgets.QWidget):
     def _history_path(self) -> Path:
         return Path.home() / ".kaligpt" / "history.json"
 
+    def _memory_path(self) -> Path:
+        return Path.home() / ".kaligpt" / "memory.json"
+
     def _tasks_path(self) -> Path:
         return Path.home() / ".kaligpt" / "tasks.json"
+
+    def _load_memory(self) -> dict[str, object]:
+        memory_path = self._memory_path()
+        if not memory_path.exists():
+            return {"preferences": {}, "task_outcomes": [], "failures": []}
+        try:
+            with memory_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return {
+                "preferences": dict(payload.get("preferences", {})),
+                "task_outcomes": list(payload.get("task_outcomes", [])),
+                "failures": list(payload.get("failures", [])),
+            }
+        except (OSError, ValueError, TypeError):
+            return {"preferences": {}, "task_outcomes": [], "failures": []}
+
+    def _save_memory(self) -> None:
+        memory_path = self._memory_path()
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        with memory_path.open("w", encoding="utf-8") as handle:
+            json.dump(self._memory, handle, indent=2)
+
+    def _summarize_preferences(self) -> str:
+        preferences = self._memory.get("preferences", {})
+        if not isinstance(preferences, dict) or not preferences:
+            return "Preferences: none saved"
+        pairs = []
+        for key, value in preferences.items():
+            pairs.append(f"{key}={value}")
+        return "Preferences: " + ", ".join(pairs)
+
+    def _update_preferences_label(self) -> None:
+        self.preferences_label.setText(self._summarize_preferences())
 
     def _load_tasks(self) -> None:
         tasks_path = self._tasks_path()
@@ -1038,6 +1087,62 @@ class ChatWindow(QtWidgets.QWidget):
         payload = [task.to_payload() for task in self.task_model.tasks()]
         with tasks_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+
+    def _find_task_row(self, title: str) -> int | None:
+        for index, task in enumerate(self.task_model.tasks()):
+            if not task.completed and task.title == title:
+                return index
+        return None
+
+    @QtCore.Slot(str, int)
+    def _prompt_task_feedback(self, title: str, step_count: int) -> None:
+        prompt = f"Was task '{title}' successful?"
+        response = QtWidgets.QMessageBox.question(
+            self,
+            "Task Feedback",
+            prompt,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        success = response == QtWidgets.QMessageBox.Yes
+        summary, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Task Feedback",
+            "What worked or failed?",
+        )
+        summary_text = summary.strip() if ok else ""
+        self._record_task_feedback(title, step_count, success, summary_text)
+
+    def _record_task_feedback(
+        self,
+        title: str,
+        step_count: int,
+        success: bool,
+        summary: str,
+    ) -> None:
+        timestamp = datetime.now().isoformat()
+        outcome = {
+            "title": title,
+            "step": step_count,
+            "success": success,
+            "summary": summary,
+            "timestamp": timestamp,
+        }
+        self._memory.setdefault("task_outcomes", []).append(outcome)
+        if not success:
+            self._memory.setdefault("failures", []).append(
+                {"title": title, "summary": summary, "timestamp": timestamp}
+            )
+        self._save_memory()
+        status = "succeeded" if success else "failed"
+        message = f"Feedback recorded: '{title}' {status}."
+        if summary:
+            message = f"{message} Summary: {summary}"
+        self.controls_panel.log(message)
+        if success:
+            row = self._find_task_row(title)
+            if row is not None:
+                self.task_model.toggle_complete(row)
+                self._refresh_task_controls()
 
     def _refresh_task_snapshot(self) -> None:
         with self._task_snapshot_lock:
@@ -1139,6 +1244,7 @@ class ChatWindow(QtWidgets.QWidget):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         self._save_history()
         self._save_tasks()
+        self._save_memory()
         QtCore.QMetaObject.invokeMethod(
             self._agent_runner, "cancel", QtCore.Qt.BlockingQueuedConnection
         )

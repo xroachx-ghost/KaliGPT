@@ -76,7 +76,9 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.screenshot_label = QtWidgets.QLabel()
         self.screenshot_label.setFixedHeight(240)
         self.screenshot_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.screenshot_label.setStyleSheet("background: #111; color: #eee; border-radius: 6px;")
+        self.screenshot_label.setStyleSheet(
+            "background: #1f2023; color: #9aa0a6; border-radius: 8px; border: 1px solid #33343a;"
+        )
         self.screenshot_label.setText("No preview")
 
         self.take_screenshot_button = QtWidgets.QPushButton("Take Desktop Snapshot")
@@ -139,6 +141,90 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.log("Screenshot updated.")
 
 
+class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._bubble_padding = 12
+        self._text_padding = 12
+        self._max_width_ratio = 0.7
+
+    def paint(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        message: ChatMessage | None = index.data(QtCore.Qt.UserRole)
+        if message is None:
+            return
+
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        rect = option.rect
+        view_width = option.widget.width() if option.widget else rect.width()
+        max_width = max(280, int(view_width * self._max_width_ratio))
+        font = option.font
+        metrics = QtGui.QFontMetrics(font)
+
+        text_rect = metrics.boundingRect(
+            0,
+            0,
+            max_width - 2 * self._text_padding,
+            10_000,
+            QtCore.Qt.TextWordWrap,
+            message.content,
+        )
+        bubble_width = text_rect.width() + 2 * self._text_padding
+        bubble_height = text_rect.height() + 2 * self._text_padding
+
+        if message.role == "user":
+            bubble_color = QtGui.QColor("#10a37f")
+            text_color = QtGui.QColor("#ffffff")
+            x = rect.right() - bubble_width - self._bubble_padding
+        else:
+            bubble_color = QtGui.QColor("#444654")
+            text_color = QtGui.QColor("#ffffff")
+            x = rect.left() + self._bubble_padding
+
+        y = rect.top() + self._bubble_padding // 2
+        bubble_rect = QtCore.QRect(x, y, bubble_width, bubble_height)
+
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(bubble_color)
+        painter.drawRoundedRect(bubble_rect, 12, 12)
+
+        text_draw_rect = bubble_rect.adjusted(
+            self._text_padding, self._text_padding, -self._text_padding, -self._text_padding
+        )
+        painter.setPen(text_color)
+        painter.drawText(text_draw_rect, QtCore.Qt.TextWordWrap, message.content)
+
+        painter.restore()
+
+    def sizeHint(
+        self,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> QtCore.QSize:
+        message: ChatMessage | None = index.data(QtCore.Qt.UserRole)
+        if message is None:
+            return QtCore.QSize(0, 0)
+        view_width = option.widget.width() if option.widget else 600
+        max_width = max(280, int(view_width * self._max_width_ratio))
+        metrics = QtGui.QFontMetrics(option.font)
+        text_rect = metrics.boundingRect(
+            0,
+            0,
+            max_width - 2 * self._text_padding,
+            10_000,
+            QtCore.Qt.TextWordWrap,
+            message.content,
+        )
+        height = text_rect.height() + 2 * self._text_padding + self._bubble_padding
+        return QtCore.QSize(view_width, height)
+
+
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -149,11 +235,15 @@ class ChatWindow(QtWidgets.QWidget):
         self.chat_view = QtWidgets.QListView()
         self.chat_view.setModel(self.chat_model)
         self.chat_view.setWordWrap(True)
-        self.chat_view.setStyleSheet("font-size: 14px;")
+        self.chat_view.setSpacing(8)
+        self.chat_view.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.chat_view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.chat_view.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.chat_view.setItemDelegate(ChatBubbleDelegate(self.chat_view))
 
         self.message_input = QtWidgets.QTextEdit()
-        self.message_input.setPlaceholderText("Ask KaliGPT to help with your workflow...")
-        self.message_input.setFixedHeight(120)
+        self.message_input.setPlaceholderText("Message KaliGPT...")
+        self.message_input.setFixedHeight(100)
 
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.clicked.connect(self.handle_send)
@@ -162,24 +252,99 @@ class ChatWindow(QtWidgets.QWidget):
 
         self.api_status = QtWidgets.QLabel()
         self.api_status.setText(self._api_status_text())
-        self.api_status.setStyleSheet("color: #888;")
+        self.api_status.setStyleSheet("color: #9aa0a6; font-size: 12px;")
+
+        header_title = QtWidgets.QLabel("KaliGPT")
+        header_title.setObjectName("HeaderTitle")
+        header_subtitle = QtWidgets.QLabel("Your AI assistant for secure workflows")
+        header_subtitle.setObjectName("HeaderSubtitle")
+
+        header_layout = QtWidgets.QVBoxLayout()
+        header_layout.addWidget(header_title)
+        header_layout.addWidget(header_subtitle)
+        header_layout.setSpacing(2)
+
+        header_widget = QtWidgets.QWidget()
+        header_widget.setLayout(header_layout)
 
         chat_layout = QtWidgets.QVBoxLayout()
-        chat_layout.addWidget(QtWidgets.QLabel("Conversation"))
+        chat_layout.addWidget(header_widget)
         chat_layout.addWidget(self.chat_view)
-        chat_layout.addWidget(self.message_input)
 
-        send_layout = QtWidgets.QHBoxLayout()
-        send_layout.addWidget(self.api_status)
-        send_layout.addStretch(1)
-        send_layout.addWidget(self.send_button)
-        chat_layout.addLayout(send_layout)
+        input_layout = QtWidgets.QHBoxLayout()
+        input_layout.addWidget(self.message_input, stretch=1)
+        input_layout.addWidget(self.send_button)
+        chat_layout.addLayout(input_layout)
+        chat_layout.addWidget(self.api_status)
 
         main_layout = QtWidgets.QHBoxLayout(self)
         main_layout.addLayout(chat_layout, stretch=3)
         main_layout.addWidget(self.controls_panel, stretch=2)
 
+        self._apply_theme()
         self._load_history()
+
+    def _apply_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+                background: #202123;
+                color: #e8e8e8;
+                font-size: 14px;
+            }
+            QListView {
+                background: #202123;
+                border: none;
+            }
+            QTextEdit {
+                background: #2b2c2f;
+                border: 1px solid #3e3f4b;
+                border-radius: 12px;
+                padding: 10px;
+                color: #f5f5f5;
+            }
+            QPushButton {
+                background: #10a37f;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 18px;
+                color: white;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #0f8b6b;
+            }
+            QPushButton:pressed {
+                background: #0b6f55;
+            }
+            QPushButton:disabled {
+                background: #3a3b3f;
+                color: #9aa0a6;
+            }
+            QGroupBox {
+                background: #2b2c2f;
+                border: 1px solid #3e3f4b;
+                border-radius: 12px;
+                margin-top: 14px;
+                padding: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #e8e8e8;
+                font-weight: 600;
+            }
+            QLabel#HeaderTitle {
+                font-size: 22px;
+                font-weight: 600;
+            }
+            QLabel#HeaderSubtitle {
+                color: #9aa0a6;
+                font-size: 13px;
+            }
+            """
+        )
 
     def _api_status_text(self) -> str:
         if openai is None:

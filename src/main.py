@@ -118,6 +118,21 @@ class ChatMessage:
         return f"[{time_str}] {self.role.title()}: {self.content}"
 
 
+class ProviderHealthState(Enum):
+    UNKNOWN = "unknown"
+    OK = "ok"
+    ERROR = "error"
+    RETRYING = "retrying"
+
+
+@dataclass
+class ProviderHealth:
+    state: ProviderHealthState = ProviderHealthState.UNKNOWN
+    last_error_time: Optional[datetime] = None
+    last_error_message: Optional[str] = None
+    retry_after_seconds: Optional[float] = None
+
+
 @dataclass
 class Task:
     title: str
@@ -1055,6 +1070,9 @@ class ChatWindow(QtWidgets.QWidget):
         self._first_run = self._needs_first_run_wizard()
         self._suppress_api_prompt = self._first_run
         self._load_api_keys()
+        self._provider_health = {
+            provider: ProviderHealth() for provider in PROVIDER_REGISTRY
+        }
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -1078,6 +1096,11 @@ class ChatWindow(QtWidgets.QWidget):
         self.provider_label = QtWidgets.QLabel("Provider")
         self.provider_selector = QtWidgets.QComboBox()
         self.provider_selector.currentIndexChanged.connect(self._handle_provider_change)
+        self.provider_status_widget = QtWidgets.QWidget()
+        self.provider_status_layout = QtWidgets.QHBoxLayout(self.provider_status_widget)
+        self.provider_status_layout.setContentsMargins(0, 0, 0, 0)
+        self.provider_status_layout.setSpacing(6)
+        self._provider_status_labels: dict[str, QtWidgets.QLabel] = {}
 
         self.model_label = QtWidgets.QLabel("Model")
         self.model_selector = QtWidgets.QComboBox()
@@ -1208,6 +1231,7 @@ class ChatWindow(QtWidgets.QWidget):
         model_layout = QtWidgets.QHBoxLayout()
         model_layout.addWidget(self.provider_label)
         model_layout.addWidget(self.provider_selector)
+        model_layout.addWidget(self.provider_status_widget)
         model_layout.addWidget(self.model_label)
         model_layout.addWidget(self.model_selector)
         model_layout.addStretch()
@@ -1251,6 +1275,7 @@ class ChatWindow(QtWidgets.QWidget):
 
         self._apply_theme()
         self._configure_mode()
+        self._build_provider_status_widgets()
         self._load_desktop_control_preference()
         self._load_behavior_preferences()
         self._load_history()
@@ -1337,6 +1362,13 @@ class ChatWindow(QtWidgets.QWidget):
                 border-radius: 6px;
                 padding: 4px 8px;
                 font-weight: 600;
+            }
+            QLabel#ProviderStatusLabel {
+                font-size: 11px;
+                color: #9aa0a6;
+                border: 1px solid #3e3f4b;
+                border-radius: 10px;
+                padding: 2px 6px;
             }
             QTableView {
                 background: #202123;
@@ -1516,6 +1548,47 @@ class ChatWindow(QtWidgets.QWidget):
         self._populate_model_selector()
         self._persist_model_selection()
 
+    def _build_provider_status_widgets(self) -> None:
+        while self.provider_status_layout.count():
+            item = self.provider_status_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._provider_status_labels.clear()
+        for provider, info in PROVIDER_REGISTRY.items():
+            label = QtWidgets.QLabel()
+            label.setObjectName("ProviderStatusLabel")
+            label.setTextFormat(QtCore.Qt.RichText)
+            label.setToolTip(f"{info['label']} provider status.")
+            self._provider_status_labels[provider] = label
+            self.provider_status_layout.addWidget(label)
+        self._update_provider_status_labels()
+
+    def _format_provider_status(self, provider: str) -> tuple[str, str]:
+        info = PROVIDER_REGISTRY[provider]
+        health = self._provider_health.get(provider, ProviderHealth())
+        label = info["label"]
+        if health.state == ProviderHealthState.OK:
+            return ("#34d399", f"{label}: Ready")
+        if health.state == ProviderHealthState.RETRYING:
+            retry = health.retry_after_seconds or 0
+            return ("#fbbf24", f"{label}: Retrying in {retry:.1f}s…")
+        if health.state == ProviderHealthState.ERROR:
+            time_str = (
+                health.last_error_time.strftime("%H:%M:%S")
+                if health.last_error_time
+                else "Unknown time"
+            )
+            return ("#f87171", f"{label}: Error at {time_str}")
+        return ("#9aa0a6", f"{label}: Idle")
+
+    def _update_provider_status_labels(self) -> None:
+        for provider, label in self._provider_status_labels.items():
+            color, text = self._format_provider_status(provider)
+            label.setText(f"<span style='color:{color}'>●</span> {text}")
+            health = self._provider_health.get(provider)
+            if health and health.last_error_message:
+                label.setToolTip(health.last_error_message)
     def _populate_model_selector(self) -> None:
         provider = self._selected_provider()
         if not provider:
@@ -1681,8 +1754,47 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _update_api_status(self) -> None:
         status_text = self._api_status_text()
+        provider = self._selected_provider()
+        if provider:
+            status_text = f"{status_text} {self._provider_status_message(provider)}"
         self.api_status.setText(status_text)
         self._update_demo_mode_banner(status_text)
+
+    def _provider_status_message(self, provider: str) -> str:
+        health = self._provider_health.get(provider)
+        if health is None:
+            return ""
+        if health.state == ProviderHealthState.OK:
+            return "Status: Ready."
+        if health.state == ProviderHealthState.RETRYING:
+            retry = health.retry_after_seconds or 0
+            return f"Status: Retrying in {retry:.1f}s…"
+        if health.state == ProviderHealthState.ERROR:
+            time_str = (
+                health.last_error_time.strftime("%H:%M:%S")
+                if health.last_error_time
+                else "Unknown time"
+            )
+            return f"Status: Error at {time_str}."
+        return "Status: Idle."
+
+    def _set_provider_health(
+        self,
+        provider: str,
+        state: ProviderHealthState,
+        *,
+        error_message: Optional[str] = None,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
+        health = self._provider_health.setdefault(provider, ProviderHealth())
+        health.state = state
+        health.retry_after_seconds = retry_after_seconds
+        if error_message:
+            health.last_error_message = error_message
+        if state in {ProviderHealthState.ERROR, ProviderHealthState.RETRYING}:
+            health.last_error_time = datetime.now()
+        self._update_provider_status_labels()
+        self._update_api_status()
 
     def _update_demo_mode_banner(self, status_text: str) -> None:
         text = status_text.lower()
@@ -2148,6 +2260,48 @@ class ChatWindow(QtWidgets.QWidget):
         for action in self._extract_actions(response):
             self._dispatch_action(action)
 
+    def _call_with_retries(self, provider: str, api_call: Callable[[], str]) -> str:
+        max_retries = 3
+        base_delay = 1.2
+        for attempt in range(max_retries + 1):
+            try:
+                result = api_call()
+            except Exception as exc:  # pragma: no cover - network call
+                if attempt >= max_retries:
+                    self._set_provider_health(
+                        provider,
+                        ProviderHealthState.ERROR,
+                        error_message=str(exc),
+                    )
+                    raise
+                delay = base_delay * (2**attempt)
+                delay += random.uniform(0, 0.4)
+                self._set_provider_health(
+                    provider,
+                    ProviderHealthState.RETRYING,
+                    error_message=str(exc),
+                    retry_after_seconds=delay,
+                )
+                QtWidgets.QApplication.processEvents()
+                time.sleep(delay)
+                continue
+            self._set_provider_health(provider, ProviderHealthState.OK)
+            return result
+        raise RuntimeError("Failed to obtain response after retries.")
+
+    def _friendly_api_error(self, provider: str) -> str:
+        label = PROVIDER_REGISTRY[provider]["label"]
+        health = self._provider_health.get(provider)
+        time_str = (
+            health.last_error_time.strftime("%H:%M:%S")
+            if health and health.last_error_time
+            else "an unknown time"
+        )
+        return (
+            f"{label} API is unavailable right now. "
+            f"Last error at {time_str}. Please try again shortly."
+        )
+
     def _generate_response(self) -> str:
         provider = self._selected_provider()
         if not provider:
@@ -2188,17 +2342,19 @@ class ChatWindow(QtWidgets.QWidget):
                 client_kwargs["base_url"] = base_url
             client = openai.OpenAI(**client_kwargs)
             try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                response = self._call_with_retries(
+                    provider,
+                    lambda: client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    ).choices[0].message.content,
                 )
-                response = completion.choices[0].message.content
                 self._dispatch_actions(response)
                 return response
-            except Exception as exc:  # pragma: no cover - network call
-                return f"API error: {exc}"
+            except Exception:  # pragma: no cover - network call
+                return self._friendly_api_error(provider)
 
         if provider == "anthropic":
             if anthropic is None:
@@ -2211,20 +2367,25 @@ class ChatWindow(QtWidgets.QWidget):
                 return f"Set {env_key} to enable {provider_info['label']} responses."
             client = anthropic.Anthropic(api_key=os.getenv(env_key))
             try:
-                response = client.messages.create(
-                    model=model_id,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=system_message,
-                    messages=self.chat_model.as_openai_messages(),
-                )
-                if response.content:
-                    content = response.content[0].text
+                def _anthropic_call() -> str:
+                    response = client.messages.create(
+                        model=model_id,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        system=system_message,
+                        messages=self.chat_model.as_openai_messages(),
+                    )
+                    if response.content:
+                        return response.content[0].text
+                    return ""
+
+                content = self._call_with_retries(provider, _anthropic_call)
+                if content:
                     self._dispatch_actions(content)
                     return content
                 return "No response content returned from Anthropic."
-            except Exception as exc:  # pragma: no cover - network call
-                return f"API error: {exc}"
+            except Exception:  # pragma: no cover - network call
+                return self._friendly_api_error(provider)
 
         if provider == "gemini":
             self._maybe_prompt_api_key()
@@ -2244,12 +2405,15 @@ class ChatWindow(QtWidgets.QWidget):
                 for msg in messages
             )
             try:
-                response = model.generate_content(prompt)
-                content = response.text or "No response content returned from Gemini."
+                content = self._call_with_retries(
+                    provider,
+                    lambda: model.generate_content(prompt).text
+                    or "No response content returned from Gemini.",
+                )
                 self._dispatch_actions(content)
                 return content
-            except Exception as exc:  # pragma: no cover - network call
-                return f"API error: {exc}"
+            except Exception:  # pragma: no cover - network call
+                return self._friendly_api_error(provider)
 
         if provider == "cohere":
             self._maybe_prompt_api_key()
@@ -2267,12 +2431,15 @@ class ChatWindow(QtWidgets.QWidget):
                 for msg in messages
             )
             try:
-                response = client.chat(model=model_id, message=prompt)
-                content = response.text or "No response content returned from Cohere."
+                content = self._call_with_retries(
+                    provider,
+                    lambda: client.chat(model=model_id, message=prompt).text
+                    or "No response content returned from Cohere.",
+                )
                 self._dispatch_actions(content)
                 return content
-            except Exception as exc:  # pragma: no cover - network call
-                return f"API error: {exc}"
+            except Exception:  # pragma: no cover - network call
+                return self._friendly_api_error(provider)
 
         return f"No client available for provider '{provider}'."
 

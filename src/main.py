@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -1737,6 +1738,78 @@ class ChatWindow(QtWidgets.QWidget):
         self.chat_model.add_message(message)
         self.chat_view.scrollToBottom()
 
+    def _extract_actions(self, response: str) -> list[dict[str, object]]:
+        action_blocks: list[dict[str, object]] = []
+        for match in re.finditer(r"```json\\s*(\\{.*?\\})\\s*```", response, re.DOTALL):
+            snippet = match.group(1)
+            try:
+                payload = json.loads(snippet)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and "action" in payload:
+                action_blocks.append(payload)
+            elif isinstance(payload, dict) and "actions" in payload:
+                actions = payload.get("actions")
+                if isinstance(actions, list):
+                    action_blocks.extend(action for action in actions if isinstance(action, dict))
+        return action_blocks
+
+    def _format_action_summary(self, action: str, parameters: dict[str, object]) -> str:
+        if action == "move_mouse":
+            return f"Move mouse to ({parameters.get('x')}, {parameters.get('y')})"
+        if action == "click_mouse":
+            return (
+                "Click mouse "
+                f"button={parameters.get('button', 'left')}, "
+                f"clicks={parameters.get('clicks', 1)}"
+            )
+        if action == "type_text":
+            text = str(parameters.get("text", ""))
+            preview = text if len(text) <= 60 else f"{text[:57]}..."
+            return f"Type text: {preview!r}"
+        if action == "press_key":
+            return f"Press key: {parameters.get('key')}"
+        return f"Unknown action: {action}"
+
+    def _dispatch_action(self, action_payload: dict[str, object]) -> None:
+        action = action_payload.get("action")
+        if not isinstance(action, str):
+            return
+        parameters = action_payload.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        summary = self._format_action_summary(action, parameters)
+        self.controls_panel.log(f"Action requested: {summary}")
+        if not self.controls_panel.isEnabled():
+            self.controls_panel.log("Action skipped: control panel is disabled.")
+            return
+        prompt = f"Execute action?\n\n{summary}"
+        response = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Action",
+            prompt,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if response != QtWidgets.QMessageBox.Yes:
+            self.controls_panel.log("Action canceled by user.")
+            return
+        dispatch_map = {
+            "move_mouse": self.controls_panel.move_mouse,
+            "click_mouse": self.controls_panel.click_mouse,
+            "type_text": self.controls_panel.type_text,
+            "press_key": self.controls_panel.press_key,
+        }
+        handler = dispatch_map.get(action)
+        if handler is None:
+            self.controls_panel.log(f"Action ignored: unsupported action '{action}'.")
+            return
+        handler(**parameters)
+        self.controls_panel.log("Action executed.")
+
+    def _dispatch_actions(self, response: str) -> None:
+        for action in self._extract_actions(response):
+            self._dispatch_action(action)
+
     def _generate_response(self) -> str:
         provider = self._selected_provider()
         if not provider:
@@ -1746,7 +1819,15 @@ class ChatWindow(QtWidgets.QWidget):
         env_key = provider_info["env_key"]
         behavior = self._behavior_preferences()
         system_message = (
-            "You are {persona}. Respond in a {tone} tone."
+            "You are {persona}. Respond in a {tone} tone. "
+            "When you want to request a desktop automation action, include a JSON snippet "
+            "wrapped in a ```json code fence after your response. "
+            "Use the format: {\"action\": \"move_mouse|click_mouse|type_text|press_key\", "
+            "\"parameters\": {\"x\": 0, \"y\": 0}}. "
+            "Use parameters appropriate to the action: move_mouse(x, y, duration), "
+            "click_mouse(button, clicks, interval), type_text(text), press_key(key). "
+            "You may include multiple actions by returning multiple JSON blocks or a single "
+            "{\"actions\": [...]} block. Only use valid JSON."
         ).format(persona=behavior["persona"], tone=behavior["tone"])
         messages = [{"role": "system", "content": system_message}]
         messages.extend(self.chat_model.as_openai_messages())
@@ -1775,7 +1856,9 @@ class ChatWindow(QtWidgets.QWidget):
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                return completion.choices[0].message.content
+                response = completion.choices[0].message.content
+                self._dispatch_actions(response)
+                return response
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
 
@@ -1798,7 +1881,9 @@ class ChatWindow(QtWidgets.QWidget):
                     messages=self.chat_model.as_openai_messages(),
                 )
                 if response.content:
-                    return response.content[0].text
+                    content = response.content[0].text
+                    self._dispatch_actions(content)
+                    return content
                 return "No response content returned from Anthropic."
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
@@ -1822,7 +1907,9 @@ class ChatWindow(QtWidgets.QWidget):
             )
             try:
                 response = model.generate_content(prompt)
-                return response.text if response.text else "No response content returned from Gemini."
+                content = response.text or "No response content returned from Gemini."
+                self._dispatch_actions(content)
+                return content
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
 
@@ -1843,7 +1930,9 @@ class ChatWindow(QtWidgets.QWidget):
             )
             try:
                 response = client.chat(model=model_id, message=prompt)
-                return response.text if response.text else "No response content returned from Cohere."
+                content = response.text or "No response content returned from Cohere."
+                self._dispatch_actions(content)
+                return content
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
 

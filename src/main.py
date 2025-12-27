@@ -1333,7 +1333,7 @@ class FirstRunWizard(QtWidgets.QWizard):
         status_label.setText("Looks good")
         status_label.setStyleSheet("color: #6ee7b7; font-size: 11px;")
 
-class ChatWindow(QtWidgets.QWidget):
+class ChatWindow(QtWidgets.QMainWindow):
     DEFAULT_PREFERENCES = {
         "persona": "General assistant",
         "tone": "Neutral",
@@ -1517,11 +1517,31 @@ class ChatWindow(QtWidgets.QWidget):
             self._handle_manual_action
         )
         self.controls_panel.export_audit_requested.connect(self._export_audit_log)
+        self.controls_dock = QtWidgets.QDockWidget("Computer Control", self)
+        self.controls_dock.setObjectName("ControlsDock")
+        self.controls_dock.setWidget(self.controls_panel)
+        self.controls_dock.setAllowedAreas(
+            QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
+        )
+        self.controls_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+        )
         self.monitoring_panel = QtWidgets.QGroupBox("Monitoring")
         self.monitoring_window_label = QtWidgets.QLabel("Active window: Unavailable")
         self.monitoring_process_label = QtWidgets.QLabel("Foreground process: Unavailable")
         self.monitoring_cpu_label = QtWidgets.QLabel("CPU load: Unavailable")
         self.monitoring_memory_label = QtWidgets.QLabel("Memory usage: Unavailable")
+        self.monitoring_dock = QtWidgets.QDockWidget("Monitoring", self)
+        self.monitoring_dock.setObjectName("MonitoringDock")
+        self.monitoring_dock.setWidget(self.monitoring_panel)
+        self.monitoring_dock.setAllowedAreas(
+            QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
+        )
+        self.monitoring_dock.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetMovable
+            | QtWidgets.QDockWidget.DockWidgetFloatable
+        )
         self._monitor_last_window: Optional[str] = None
         self._monitor_last_process: Optional[str] = None
         self._monitor_last_cpu: Optional[float] = None
@@ -1590,12 +1610,12 @@ class ChatWindow(QtWidgets.QWidget):
         header_widget = QtWidgets.QWidget()
         header_widget.setLayout(header_layout)
 
-        conversation_layout = QtWidgets.QHBoxLayout()
+        conversation_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
         conversation_layout.addWidget(self.conversation_label)
         conversation_layout.addWidget(self.conversation_selector, stretch=1)
         conversation_layout.addWidget(self.new_conversation_button)
 
-        search_layout = QtWidgets.QHBoxLayout()
+        search_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
         search_layout.addWidget(QtWidgets.QLabel("Search"))
         search_layout.addWidget(self.search_input, stretch=1)
 
@@ -1606,11 +1626,11 @@ class ChatWindow(QtWidgets.QWidget):
         chat_layout.addLayout(search_layout)
         chat_layout.addWidget(self.chat_view)
 
-        input_layout = QtWidgets.QHBoxLayout()
+        input_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
         input_layout.addWidget(self.message_input, stretch=1)
         input_layout.addWidget(self.send_button)
 
-        model_layout = QtWidgets.QHBoxLayout()
+        model_layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight)
         model_layout.addWidget(self.provider_label)
         model_layout.addWidget(self.provider_selector)
         model_layout.addWidget(self.provider_status_widget)
@@ -1649,16 +1669,49 @@ class ChatWindow(QtWidgets.QWidget):
 
         right_layout = QtWidgets.QVBoxLayout()
         right_layout.addWidget(self.task_panel)
-        right_layout.addWidget(self.controls_panel)
-        right_layout.addWidget(self.monitoring_panel)
         right_layout.addStretch()
 
         right_widget = QtWidgets.QWidget()
         right_widget.setLayout(right_layout)
 
-        main_layout = QtWidgets.QHBoxLayout(self)
-        main_layout.addLayout(chat_layout, stretch=3)
-        main_layout.addWidget(right_widget, stretch=2)
+        chat_widget = QtWidgets.QWidget()
+        chat_widget.setLayout(chat_layout)
+
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.setObjectName("MainSplitter")
+        self.main_splitter.addWidget(chat_widget)
+        self.main_splitter.addWidget(right_widget)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.setCentralWidget(self.main_splitter)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.controls_dock)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.monitoring_dock)
+        self.tabifyDockWidget(self.controls_dock, self.monitoring_dock)
+        self.setDockOptions(
+            QtWidgets.QMainWindow.AllowTabbedDocks
+            | QtWidgets.QMainWindow.AllowNestedDocks
+            | QtWidgets.QMainWindow.AnimatedDocks
+        )
+
+        layout_margin = 16
+        layout_spacing = 12
+        chat_layout.setContentsMargins(layout_margin, layout_margin, layout_margin, layout_margin)
+        chat_layout.setSpacing(layout_spacing)
+        right_layout.setContentsMargins(layout_margin, layout_margin, layout_margin, layout_margin)
+        right_layout.setSpacing(layout_spacing)
+        task_layout.setSpacing(10)
+        monitoring_layout.setSpacing(6)
+        behavior_form.setContentsMargins(8, 12, 8, 8)
+        behavior_form.setVerticalSpacing(10)
+        behavior_form.setHorizontalSpacing(12)
+
+        self._responsive_layouts = [
+            conversation_layout,
+            search_layout,
+            input_layout,
+            model_layout,
+        ]
+        self._compact_mode = False
 
         self._apply_theme()
         self._configure_mode()
@@ -1684,6 +1737,32 @@ class ChatWindow(QtWidgets.QWidget):
         self._refresh_monitoring()
         self._update_api_status()
         self._maybe_show_first_run_wizard()
+        self._update_layout_breakpoints()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_layout_breakpoints()
+
+    def _update_layout_breakpoints(self) -> None:
+        compact_width = 980
+        is_compact = self.width() < compact_width
+        if is_compact == self._compact_mode:
+            return
+        self._compact_mode = is_compact
+        direction = (
+            QtWidgets.QBoxLayout.TopToBottom
+            if is_compact
+            else QtWidgets.QBoxLayout.LeftToRight
+        )
+        for layout in self._responsive_layouts:
+            layout.setDirection(direction)
+        self.main_splitter.setOrientation(
+            QtCore.Qt.Vertical if is_compact else QtCore.Qt.Horizontal
+        )
+        if is_compact:
+            self.main_splitter.setSizes([int(self.height() * 0.65), int(self.height() * 0.35)])
+        else:
+            self.main_splitter.setSizes([int(self.width() * 0.62), int(self.width() * 0.38)])
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(
@@ -1703,6 +1782,22 @@ class ChatWindow(QtWidgets.QWidget):
                 border-radius: 12px;
                 padding: 10px;
                 color: #f5f5f5;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                background: #2b2c2f;
+                border: 1px solid #3e3f4b;
+                border-radius: 10px;
+                padding: 6px 10px;
+                color: #f5f5f5;
+                min-height: 28px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 6px;
+            }
+            QAbstractItemView {
+                selection-background-color: #2f775f;
+                selection-color: #f5f5f5;
             }
             QPushButton {
                 background: #10a37f;
@@ -1726,14 +1821,20 @@ class ChatWindow(QtWidgets.QWidget):
                 background: #2b2c2f;
                 border: 1px solid #3e3f4b;
                 border-radius: 12px;
-                margin-top: 14px;
-                padding: 12px;
+                margin-top: 18px;
+                padding: 14px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
+                left: 14px;
+                padding: 0 8px;
                 color: #e8e8e8;
+                font-weight: 600;
+            }
+            QDockWidget::title {
+                background: #2b2c2f;
+                color: #e8e8e8;
+                padding: 6px 10px;
                 font-weight: 600;
             }
             QLabel#HeaderTitle {
@@ -1771,7 +1872,7 @@ class ChatWindow(QtWidgets.QWidget):
             QHeaderView::section {
                 background: #2b2c2f;
                 color: #e8e8e8;
-                padding: 6px;
+                padding: 8px;
                 border: none;
                 font-weight: 600;
             }
@@ -1783,6 +1884,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.controls_panel.setVisible(is_agent_mode)
         self.controls_panel.setEnabled(is_agent_mode)
         self.controls_panel.set_agent_mode(is_agent_mode)
+        self.controls_dock.setVisible(is_agent_mode)
         if not is_agent_mode:
             self.controls_panel.setChecked(False)
             self.agent_toggle_button.setChecked(False)

@@ -225,9 +225,61 @@ class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):
         return QtCore.QSize(view_width, height)
 
 
+class ModeSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Mode")
+        self.setModal(True)
+
+        title = QtWidgets.QLabel("Choose a startup mode")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+
+        self.normal_mode_radio = QtWidgets.QRadioButton("Normal AI mode")
+        self.normal_mode_radio.setChecked(True)
+        self.agent_mode_radio = QtWidgets.QRadioButton("Agent mode")
+
+        normal_description = QtWidgets.QLabel(
+            "Best for chat-only workflows without desktop automation controls."
+        )
+        normal_description.setWordWrap(True)
+        normal_description.setStyleSheet("color: #9aa0a6;")
+        agent_description = QtWidgets.QLabel(
+            "Includes computer control tools and automation activity panels."
+        )
+        agent_description.setWordWrap(True)
+        agent_description.setStyleSheet("color: #9aa0a6;")
+
+        normal_layout = QtWidgets.QVBoxLayout()
+        normal_layout.addWidget(self.normal_mode_radio)
+        normal_layout.addWidget(normal_description)
+
+        agent_layout = QtWidgets.QVBoxLayout()
+        agent_layout.addWidget(self.agent_mode_radio)
+        agent_layout.addWidget(agent_description)
+
+        options_layout = QtWidgets.QHBoxLayout()
+        options_layout.addLayout(normal_layout)
+        options_layout.addLayout(agent_layout)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addLayout(options_layout)
+        layout.addWidget(buttons)
+
+    def selected_mode(self) -> str:
+        return "agent" if self.agent_mode_radio.isChecked() else "normal"
+
+
 class ChatWindow(QtWidgets.QWidget):
-    def __init__(self) -> None:
+    def __init__(self, mode: str) -> None:
         super().__init__()
+        self.mode = mode
         self.setWindowTitle("KaliGPT Workstation")
         self.resize(1200, 720)
 
@@ -282,6 +334,7 @@ class ChatWindow(QtWidgets.QWidget):
         main_layout.addWidget(self.controls_panel, stretch=2)
 
         self._apply_theme()
+        self._configure_mode()
         self._load_history()
 
     def _apply_theme(self) -> None:
@@ -345,6 +398,13 @@ class ChatWindow(QtWidgets.QWidget):
             }
             """
         )
+
+    def _configure_mode(self) -> None:
+        is_agent_mode = self.mode == "agent"
+        self.controls_panel.setVisible(is_agent_mode)
+        self.controls_panel.setEnabled(is_agent_mode)
+        if not is_agent_mode:
+            self.controls_panel.setChecked(False)
 
     def _api_status_text(self) -> str:
         if openai is None:
@@ -425,7 +485,10 @@ class ChatWindow(QtWidgets.QWidget):
 def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = ChatWindow()
+    dialog = ModeSelectionDialog()
+    if dialog.exec() != QtWidgets.QDialog.Accepted:
+        return 0
+    window = ChatWindow(dialog.selected_mode())
     window.show()
     return app.exec()
 

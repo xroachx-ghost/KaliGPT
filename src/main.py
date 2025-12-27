@@ -25,6 +25,34 @@ try:
 except ImportError:  # pragma: no cover - handled in UI
     openai = None
 
+try:
+    import anthropic
+except ImportError:  # pragma: no cover - handled in UI
+    anthropic = None
+
+
+MODEL_REGISTRY = [
+    {
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+        "display_name": "OpenAI GPT-4o Mini",
+    },
+    {
+        "provider": "openai",
+        "model_id": "gpt-4o",
+        "display_name": "OpenAI GPT-4o",
+    },
+    {
+        "provider": "anthropic",
+        "model_id": "claude-3-5-sonnet-latest",
+        "display_name": "Anthropic Claude 3.5 Sonnet",
+    },
+    {
+        "provider": "anthropic",
+        "model_id": "claude-3-5-haiku-latest",
+        "display_name": "Anthropic Claude 3.5 Haiku",
+    },
+]
 
 @dataclass
 class ChatMessage:
@@ -787,6 +815,11 @@ class ChatWindow(QtWidgets.QWidget):
         self.message_input.setPlaceholderText("Message KaliGPT...")
         self.message_input.setFixedHeight(100)
 
+        self.model_label = QtWidgets.QLabel("Model")
+        self.model_selector = QtWidgets.QComboBox()
+        self._populate_model_selector()
+        self.model_selector.currentIndexChanged.connect(self._handle_model_change)
+
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.clicked.connect(self.handle_send)
 
@@ -856,7 +889,14 @@ class ChatWindow(QtWidgets.QWidget):
         input_layout = QtWidgets.QHBoxLayout()
         input_layout.addWidget(self.message_input, stretch=1)
         input_layout.addWidget(self.send_button)
+
+        model_layout = QtWidgets.QHBoxLayout()
+        model_layout.addWidget(self.model_label)
+        model_layout.addWidget(self.model_selector)
+        model_layout.addStretch()
+
         chat_layout.addLayout(input_layout)
+        chat_layout.addLayout(model_layout)
         chat_layout.addWidget(self.api_status)
 
         task_button_layout = QtWidgets.QGridLayout()
@@ -986,11 +1026,60 @@ class ChatWindow(QtWidgets.QWidget):
             self.agent_toggle_button.setEnabled(True)
 
     def _api_status_text(self) -> str:
-        if openai is None:
-            return "OpenAI client not installed. Responses will be stubbed."
-        if not os.getenv("OPENAI_API_KEY"):
-            return "Set OPENAI_API_KEY to enable live responses."
-        return "Connected to OpenAI API."
+        model_info = self._selected_model_info()
+        provider = model_info["provider"]
+        if provider == "openai":
+            if openai is None:
+                return "OpenAI client not installed. Responses will be stubbed."
+            if not os.getenv("OPENAI_API_KEY"):
+                return "Set OPENAI_API_KEY to enable OpenAI responses."
+            return "Connected to OpenAI API."
+        if provider == "anthropic":
+            if anthropic is None:
+                return "Anthropic client not installed. Responses will be stubbed."
+            if not os.getenv("ANTHROPIC_API_KEY"):
+                return "Set ANTHROPIC_API_KEY to enable Anthropic responses."
+            return "Connected to Anthropic API."
+        return f"Provider '{provider}' is not configured. Responses will be stubbed."
+
+    def _populate_model_selector(self) -> None:
+        self.model_selector.clear()
+        preferences = self._memory.get("preferences", {})
+        preferred_provider = None
+        preferred_model = None
+        if isinstance(preferences, dict):
+            preferred_provider = preferences.get("provider")
+            preferred_model = preferences.get("model")
+        selected_index = 0
+        for index, entry in enumerate(MODEL_REGISTRY):
+            self.model_selector.addItem(entry["display_name"], entry)
+            if (
+                entry["provider"] == preferred_provider
+                and entry["model_id"] == preferred_model
+            ):
+                selected_index = index
+        self.model_selector.setCurrentIndex(selected_index)
+        self._persist_model_selection(self._selected_model_info())
+
+    def _selected_model_info(self) -> dict[str, str]:
+        data = self.model_selector.currentData()
+        if isinstance(data, dict):
+            return data
+        return MODEL_REGISTRY[0]
+
+    def _persist_model_selection(self, model_info: dict[str, str]) -> None:
+        preferences = self._memory.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            preferences = {}
+            self._memory["preferences"] = preferences
+        preferences["provider"] = model_info["provider"]
+        preferences["model"] = model_info["model_id"]
+        self._save_memory()
+        self._update_preferences_label()
+
+    def _handle_model_change(self, *_: object) -> None:
+        self._persist_model_selection(self._selected_model_info())
+        self.api_status.setText(self._api_status_text())
 
     def _load_history(self) -> None:
         history_path = self._history_path()
@@ -1267,20 +1356,43 @@ class ChatWindow(QtWidgets.QWidget):
         self.chat_view.scrollToBottom()
 
     def _generate_response(self) -> str:
-        if openai is None or not os.getenv("OPENAI_API_KEY"):
-            return (
-                "I'm ready to help. Install the OpenAI SDK and set OPENAI_API_KEY "
-                "to enable live model responses."
-            )
-        client = openai.OpenAI()
-        try:
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=self.chat_model.as_openai_messages(),
-            )
-            return completion.choices[0].message.content
-        except Exception as exc:  # pragma: no cover - network call
-            return f"API error: {exc}"
+        model_info = self._selected_model_info()
+        provider = model_info["provider"]
+        model_id = model_info["model_id"]
+        if provider == "openai":
+            if openai is None or not os.getenv("OPENAI_API_KEY"):
+                return (
+                    "I'm ready to help. Install the OpenAI SDK and set OPENAI_API_KEY "
+                    "to enable live model responses."
+                )
+            client = openai.OpenAI()
+            try:
+                completion = client.chat.completions.create(
+                    model=model_id,
+                    messages=self.chat_model.as_openai_messages(),
+                )
+                return completion.choices[0].message.content
+            except Exception as exc:  # pragma: no cover - network call
+                return f"API error: {exc}"
+        if provider == "anthropic":
+            if anthropic is None or not os.getenv("ANTHROPIC_API_KEY"):
+                return (
+                    "I'm ready to help. Install the Anthropic SDK and set "
+                    "ANTHROPIC_API_KEY to enable live model responses."
+                )
+            client = anthropic.Anthropic()
+            try:
+                response = client.messages.create(
+                    model=model_id,
+                    max_tokens=1024,
+                    messages=self.chat_model.as_openai_messages(),
+                )
+                if response.content:
+                    return response.content[0].text
+                return "No response content returned from Anthropic."
+            except Exception as exc:  # pragma: no cover - network call
+                return f"API error: {exc}"
+        return f"No client available for provider '{provider}'."
 
 
 def main() -> int:

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -338,12 +340,24 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__("Computer Control", parent)
-        self.setCheckable(True)
-        self.setChecked(False)
         self._agent_mode_active = False
+        self._emergency_stopped = False
 
         self.status_label = QtWidgets.QLabel("Control disabled.")
         self.status_label.setWordWrap(True)
+
+        self.enable_control_toggle = QtWidgets.QCheckBox("Enable Control")
+        self.enable_control_toggle.toggled.connect(self.handle_control_toggle)
+
+        self.emergency_stop_button = QtWidgets.QPushButton("Emergency Stop")
+        self.emergency_stop_button.setStyleSheet(
+            "background: #a81818; color: white; font-weight: 700;"
+        )
+        self.emergency_stop_button.clicked.connect(self.handle_emergency_stop)
+
+        self.reset_stop_button = QtWidgets.QPushButton("Reset Stop")
+        self.reset_stop_button.setEnabled(False)
+        self.reset_stop_button.clicked.connect(self.handle_reset_stop)
 
         self.screenshot_label = QtWidgets.QLabel()
         self.screenshot_label.setFixedHeight(240)
@@ -365,18 +379,55 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.preview_timer.setInterval(self.preview_interval_ms)
         self.preview_timer.timeout.connect(self.capture_desktop_frame)
 
+        self.delay_min_spin = QtWidgets.QDoubleSpinBox()
+        self.delay_min_spin.setRange(0.0, 5.0)
+        self.delay_min_spin.setSingleStep(0.05)
+        self.delay_min_spin.setValue(0.15)
+        self.delay_min_spin.setSuffix(" s")
+
+        self.delay_max_spin = QtWidgets.QDoubleSpinBox()
+        self.delay_max_spin.setRange(0.0, 5.0)
+        self.delay_max_spin.setSingleStep(0.05)
+        self.delay_max_spin.setValue(0.45)
+        self.delay_max_spin.setSuffix(" s")
+
+        self.move_duration_spin = QtWidgets.QDoubleSpinBox()
+        self.move_duration_spin.setRange(0.0, 3.0)
+        self.move_duration_spin.setSingleStep(0.05)
+        self.move_duration_spin.setValue(0.2)
+        self.move_duration_spin.setSuffix(" s")
+
+        self.typing_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.typing_interval_spin.setRange(0.0, 1.0)
+        self.typing_interval_spin.setSingleStep(0.01)
+        self.typing_interval_spin.setValue(0.05)
+        self.typing_interval_spin.setSuffix(" s")
+
+        delay_form = QtWidgets.QFormLayout()
+        delay_form.addRow("Action delay min", self.delay_min_spin)
+        delay_form.addRow("Action delay max", self.delay_max_spin)
+        delay_form.addRow("Move duration", self.move_duration_spin)
+        delay_form.addRow("Typing interval", self.typing_interval_spin)
+
+        delay_widget = QtWidgets.QWidget()
+        delay_widget.setLayout(delay_form)
+
         self.activity_log = QtWidgets.QPlainTextEdit()
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Automation log will appear here.")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.enable_control_toggle)
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.addWidget(self.emergency_stop_button)
+        control_row.addWidget(self.reset_stop_button)
+        layout.addLayout(control_row)
         layout.addWidget(self.screenshot_label)
         layout.addWidget(self.take_screenshot_button)
         layout.addWidget(self.preview_toggle_button)
+        layout.addWidget(delay_widget)
         layout.addWidget(self.activity_log)
-
-        self.toggled.connect(self.handle_toggle)
         self.screenshot_captured.connect(self.update_preview)
 
     def set_agent_mode(self, active: bool) -> None:
@@ -389,24 +440,28 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             self.preview_toggle_button.blockSignals(False)
             self.preview_toggle_button.setEnabled(False)
         else:
-            self.preview_toggle_button.setEnabled(self.isChecked())
+            self.preview_toggle_button.setEnabled(True)
             self._update_preview_loop()
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.activity_log.appendPlainText(f"[{timestamp}] {message}")
 
-    def handle_toggle(self, enabled: bool) -> None:
+    def handle_control_toggle(self, enabled: bool) -> None:
+        if self._emergency_stopped:
+            self.enable_control_toggle.blockSignals(True)
+            self.enable_control_toggle.setChecked(False)
+            self.enable_control_toggle.blockSignals(False)
+            self.log("Control toggle ignored: emergency stop is active.")
+            return
         if enabled:
             self.status_label.setText(
-                "Control enabled. Keep this window visible so you can monitor the automation."
+                "Control enabled. Keep this window visible so you can monitor automation."
             )
             self.log("Control enabled.")
         else:
             self.status_label.setText("Control disabled.")
             self.log("Control disabled.")
-        self.preview_toggle_button.setEnabled(enabled and self._agent_mode_active)
-        self._update_preview_loop()
 
     def handle_screenshot(self) -> None:
         if pyautogui is None:
@@ -465,7 +520,6 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         should_run = (
             self._agent_mode_active
             and self.isEnabled()
-            and self.isChecked()
             and not self.preview_toggle_button.isChecked()
         )
         if should_run and pyautogui is None:
@@ -477,6 +531,95 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         elif not should_run and self.preview_timer.isActive():
             self.preview_timer.stop()
             self.log("Preview loop stopped.")
+
+    def handle_emergency_stop(self) -> None:
+        if self._emergency_stopped:
+            return
+        self._emergency_stopped = True
+        self.enable_control_toggle.blockSignals(True)
+        self.enable_control_toggle.setChecked(False)
+        self.enable_control_toggle.blockSignals(False)
+        self.reset_stop_button.setEnabled(True)
+        self.status_label.setText(
+            "Emergency stop engaged. Control actions are blocked until reset."
+        )
+        self.log("Emergency stop activated. All control actions blocked.")
+
+    def handle_reset_stop(self) -> None:
+        if not self._emergency_stopped:
+            return
+        self._emergency_stopped = False
+        self.reset_stop_button.setEnabled(False)
+        self.status_label.setText("Control disabled.")
+        self.log("Emergency stop cleared. Control remains disabled.")
+
+    def _control_allowed(self, action_label: str) -> bool:
+        if pyautogui is None:
+            self.log(f"{action_label} blocked: pyautogui is not installed.")
+            return False
+        if self._emergency_stopped:
+            self.log(f"{action_label} blocked: emergency stop is active.")
+            return False
+        if not self.enable_control_toggle.isChecked():
+            self.log(f"{action_label} blocked: control is disabled.")
+            return False
+        return True
+
+    def _action_delay_seconds(self) -> float:
+        minimum = self.delay_min_spin.value()
+        maximum = self.delay_max_spin.value()
+        if maximum < minimum:
+            minimum, maximum = maximum, minimum
+        if maximum == 0:
+            return 0.0
+        return random.uniform(minimum, maximum)
+
+    def _apply_action_delay(self) -> None:
+        delay = self._action_delay_seconds()
+        if delay > 0:
+            time.sleep(delay)
+
+    def move_mouse(self, x: int, y: int, duration: Optional[float] = None) -> bool:
+        if not self._control_allowed("Move mouse"):
+            return False
+        move_duration = self.move_duration_spin.value() if duration is None else duration
+        self.log(f"Moving mouse to ({x}, {y}) over {move_duration:.2f}s.")
+        self._apply_action_delay()
+        pyautogui.moveTo(x, y, duration=move_duration)
+        return True
+
+    def click_mouse(
+        self,
+        button: str = "left",
+        clicks: int = 1,
+        interval: float = 0.0,
+    ) -> bool:
+        if not self._control_allowed("Mouse click"):
+            return False
+        self.log(f"Clicking mouse: button={button}, clicks={clicks}.")
+        self._apply_action_delay()
+        pyautogui.click(button=button, clicks=clicks, interval=interval)
+        return True
+
+    def type_text(self, text: str) -> bool:
+        if not self._control_allowed("Type text"):
+            return False
+        if not text:
+            self.log("Type text skipped: empty input.")
+            return False
+        interval = self.typing_interval_spin.value()
+        self.log(f"Typing {len(text)} characters at {interval:.2f}s interval.")
+        self._apply_action_delay()
+        pyautogui.write(text, interval=interval)
+        return True
+
+    def press_key(self, key: str) -> bool:
+        if not self._control_allowed("Key press"):
+            return False
+        self.log(f"Pressing key: {key}.")
+        self._apply_action_delay()
+        pyautogui.press(key)
+        return True
 
 
 class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):

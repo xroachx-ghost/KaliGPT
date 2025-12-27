@@ -64,11 +64,13 @@ class ChatModel(QtCore.QAbstractListModel):
 
 class ComputerControlPanel(QtWidgets.QGroupBox):
     screenshot_captured = QtCore.Signal(QtGui.QPixmap)
+    preview_interval_ms = 1000
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__("Computer Control", parent)
         self.setCheckable(True)
         self.setChecked(False)
+        self._agent_mode_active = False
 
         self.status_label = QtWidgets.QLabel("Control disabled.")
         self.status_label.setWordWrap(True)
@@ -84,6 +86,15 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         self.take_screenshot_button = QtWidgets.QPushButton("Take Desktop Snapshot")
         self.take_screenshot_button.clicked.connect(self.handle_screenshot)
 
+        self.preview_toggle_button = QtWidgets.QPushButton("Pause Preview")
+        self.preview_toggle_button.setCheckable(True)
+        self.preview_toggle_button.toggled.connect(self.handle_preview_toggle)
+        self.preview_toggle_button.setEnabled(False)
+
+        self.preview_timer = QtCore.QTimer(self)
+        self.preview_timer.setInterval(self.preview_interval_ms)
+        self.preview_timer.timeout.connect(self.capture_desktop_frame)
+
         self.activity_log = QtWidgets.QPlainTextEdit()
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Automation log will appear here.")
@@ -92,10 +103,24 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.status_label)
         layout.addWidget(self.screenshot_label)
         layout.addWidget(self.take_screenshot_button)
+        layout.addWidget(self.preview_toggle_button)
         layout.addWidget(self.activity_log)
 
         self.toggled.connect(self.handle_toggle)
         self.screenshot_captured.connect(self.update_preview)
+
+    def set_agent_mode(self, active: bool) -> None:
+        self._agent_mode_active = active
+        if not active:
+            self.preview_timer.stop()
+            self.preview_toggle_button.blockSignals(True)
+            self.preview_toggle_button.setChecked(True)
+            self.preview_toggle_button.setText("Resume Preview")
+            self.preview_toggle_button.blockSignals(False)
+            self.preview_toggle_button.setEnabled(False)
+        else:
+            self.preview_toggle_button.setEnabled(self.isChecked())
+            self._update_preview_loop()
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -110,6 +135,8 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         else:
             self.status_label.setText("Control disabled.")
             self.log("Control disabled.")
+        self.preview_toggle_button.setEnabled(enabled and self._agent_mode_active)
+        self._update_preview_loop()
 
     def handle_screenshot(self) -> None:
         if pyautogui is None:
@@ -121,14 +148,27 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             return
         self.log("Capturing screenshot...")
         screenshot = pyautogui.screenshot()
-        image = screenshot.convert("RGBA")
-        qt_image = QtGui.QImage(
-            image.tobytes("raw", "RGBA"),
-            image.width,
-            image.height,
-            QtGui.QImage.Format_RGBA8888,
-        )
-        pixmap = QtGui.QPixmap.fromImage(qt_image)
+        pixmap = self._pixmap_from_screenshot(screenshot)
+        self.screenshot_captured.emit(pixmap)
+
+    def handle_preview_toggle(self, paused: bool) -> None:
+        if paused:
+            self.preview_toggle_button.setText("Resume Preview")
+            self.log("Preview paused.")
+        else:
+            self.preview_toggle_button.setText("Pause Preview")
+            self.log("Preview resumed.")
+        self._update_preview_loop()
+
+    def capture_desktop_frame(self) -> None:
+        if pyautogui is None:
+            self.preview_timer.stop()
+            self.preview_toggle_button.setChecked(True)
+            self.screenshot_label.setText("Preview unavailable")
+            self.log("Preview stopped: pyautogui is not installed.")
+            return
+        screenshot = pyautogui.screenshot()
+        pixmap = self._pixmap_from_screenshot(screenshot)
         self.screenshot_captured.emit(pixmap)
 
     def update_preview(self, pixmap: QtGui.QPixmap) -> None:
@@ -138,7 +178,35 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
             QtCore.Qt.SmoothTransformation,
         )
         self.screenshot_label.setPixmap(scaled)
-        self.log("Screenshot updated.")
+        if not self.preview_timer.isActive():
+            self.log("Screenshot updated.")
+
+    def _pixmap_from_screenshot(self, screenshot) -> QtGui.QPixmap:
+        image = screenshot.convert("RGBA")
+        qt_image = QtGui.QImage(
+            image.tobytes("raw", "RGBA"),
+            image.width,
+            image.height,
+            QtGui.QImage.Format_RGBA8888,
+        )
+        return QtGui.QPixmap.fromImage(qt_image)
+
+    def _update_preview_loop(self) -> None:
+        should_run = (
+            self._agent_mode_active
+            and self.isEnabled()
+            and self.isChecked()
+            and not self.preview_toggle_button.isChecked()
+        )
+        if should_run and pyautogui is None:
+            self.preview_toggle_button.setChecked(True)
+            return
+        if should_run and not self.preview_timer.isActive():
+            self.preview_timer.start()
+            self.log("Preview loop started.")
+        elif not should_run and self.preview_timer.isActive():
+            self.preview_timer.stop()
+            self.log("Preview loop stopped.")
 
 
 class ChatBubbleDelegate(QtWidgets.QStyledItemDelegate):
@@ -403,6 +471,7 @@ class ChatWindow(QtWidgets.QWidget):
         is_agent_mode = self.mode == "agent"
         self.controls_panel.setVisible(is_agent_mode)
         self.controls_panel.setEnabled(is_agent_mode)
+        self.controls_panel.set_agent_mode(is_agent_mode)
         if not is_agent_mode:
             self.controls_panel.setChecked(False)
 

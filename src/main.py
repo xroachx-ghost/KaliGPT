@@ -1451,7 +1451,6 @@ class ChatWindow(QtWidgets.QMainWindow):
         self.model_label = QtWidgets.QLabel("Model")
         self.model_selector = QtWidgets.QComboBox()
         self.model_selector.currentIndexChanged.connect(self._handle_model_change)
-        self._populate_provider_selector()
 
         self.behavior_group = QtWidgets.QGroupBox("Behavior")
         self.persona_input = QtWidgets.QLineEdit()
@@ -1581,6 +1580,7 @@ class ChatWindow(QtWidgets.QMainWindow):
         self.preferences_label = QtWidgets.QLabel()
         self.preferences_label.setObjectName("HeaderPreferences")
         self._update_preferences_label()
+        self._populate_provider_selector()
 
         header_layout = QtWidgets.QVBoxLayout()
         header_layout.addWidget(header_title)

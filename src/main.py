@@ -1,6 +1,7 @@
 """KaliGPT desktop controller GUI."""
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import random
@@ -31,28 +32,77 @@ except ImportError:  # pragma: no cover - handled in UI
     anthropic = None
 
 
-MODEL_REGISTRY = [
-    {
-        "provider": "openai",
-        "model_id": "gpt-4o-mini",
-        "display_name": "OpenAI GPT-4o Mini",
+PROVIDER_REGISTRY = {
+    "openai": {
+        "label": "OpenAI",
+        "env_key": "OPENAI_API_KEY",
+        "models": [
+            {"id": "gpt-4o-mini", "display": "GPT-4o Mini"},
+            {"id": "gpt-4o", "display": "GPT-4o"},
+        ],
     },
-    {
-        "provider": "openai",
-        "model_id": "gpt-4o",
-        "display_name": "OpenAI GPT-4o",
+    "anthropic": {
+        "label": "Anthropic",
+        "env_key": "ANTHROPIC_API_KEY",
+        "models": [
+            {"id": "claude-3-5-sonnet-latest", "display": "Claude 3.5 Sonnet"},
+            {"id": "claude-3-5-haiku-latest", "display": "Claude 3.5 Haiku"},
+        ],
     },
-    {
-        "provider": "anthropic",
-        "model_id": "claude-3-5-sonnet-latest",
-        "display_name": "Anthropic Claude 3.5 Sonnet",
+    "deepseek": {
+        "label": "DeepSeek",
+        "env_key": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "models": [
+            {"id": "deepseek-chat", "display": "DeepSeek Chat"},
+            {"id": "deepseek-reasoner", "display": "DeepSeek Reasoner"},
+        ],
     },
-    {
-        "provider": "anthropic",
-        "model_id": "claude-3-5-haiku-latest",
-        "display_name": "Anthropic Claude 3.5 Haiku",
+    "gemini": {
+        "label": "Google Gemini",
+        "env_key": "GEMINI_API_KEY",
+        "models": [
+            {"id": "gemini-1.5-pro", "display": "Gemini 1.5 Pro"},
+            {"id": "gemini-1.5-flash", "display": "Gemini 1.5 Flash"},
+        ],
     },
-]
+    "groq": {
+        "label": "Groq",
+        "env_key": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": [
+            {"id": "llama-3.1-70b-versatile", "display": "Llama 3.1 70B"},
+            {"id": "llama-3.1-8b-instant", "display": "Llama 3.1 8B"},
+            {"id": "mixtral-8x7b-32768", "display": "Mixtral 8x7B"},
+        ],
+    },
+    "mistral": {
+        "label": "Mistral",
+        "env_key": "MISTRAL_API_KEY",
+        "base_url": "https://api.mistral.ai/v1",
+        "models": [
+            {"id": "mistral-large-latest", "display": "Mistral Large"},
+            {"id": "mistral-small-latest", "display": "Mistral Small"},
+        ],
+    },
+    "perplexity": {
+        "label": "Perplexity",
+        "env_key": "PERPLEXITY_API_KEY",
+        "base_url": "https://api.perplexity.ai",
+        "models": [
+            {"id": "sonar", "display": "Sonar"},
+            {"id": "sonar-pro", "display": "Sonar Pro"},
+        ],
+    },
+    "cohere": {
+        "label": "Cohere",
+        "env_key": "COHERE_API_KEY",
+        "models": [
+            {"id": "command-r", "display": "Command R"},
+            {"id": "command-r-plus", "display": "Command R+"},
+        ],
+    },
+}
 
 @dataclass
 class ChatMessage:
@@ -795,6 +845,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.resize(1200, 720)
 
         self._memory = self._load_memory()
+        self._load_api_keys()
 
         self.chat_model = ChatModel(self)
         self.task_model = TaskModel(self)
@@ -815,10 +866,14 @@ class ChatWindow(QtWidgets.QWidget):
         self.message_input.setPlaceholderText("Message KaliGPT...")
         self.message_input.setFixedHeight(100)
 
+        self.provider_label = QtWidgets.QLabel("Provider")
+        self.provider_selector = QtWidgets.QComboBox()
+        self.provider_selector.currentIndexChanged.connect(self._handle_provider_change)
+
         self.model_label = QtWidgets.QLabel("Model")
         self.model_selector = QtWidgets.QComboBox()
-        self._populate_model_selector()
         self.model_selector.currentIndexChanged.connect(self._handle_model_change)
+        self._populate_provider_selector()
 
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.clicked.connect(self.handle_send)
@@ -891,6 +946,8 @@ class ChatWindow(QtWidgets.QWidget):
         input_layout.addWidget(self.send_button)
 
         model_layout = QtWidgets.QHBoxLayout()
+        model_layout.addWidget(self.provider_label)
+        model_layout.addWidget(self.provider_selector)
         model_layout.addWidget(self.model_label)
         model_layout.addWidget(self.model_selector)
         model_layout.addStretch()
@@ -1026,59 +1083,102 @@ class ChatWindow(QtWidgets.QWidget):
             self.agent_toggle_button.setEnabled(True)
 
     def _api_status_text(self) -> str:
-        model_info = self._selected_model_info()
-        provider = model_info["provider"]
-        if provider == "openai":
+        provider = self._selected_provider()
+        if not provider:
+            return "No provider selected."
+        provider_info = PROVIDER_REGISTRY[provider]
+        env_key = provider_info["env_key"]
+        if provider in {"openai", "deepseek", "groq", "mistral", "perplexity"}:
             if openai is None:
                 return "OpenAI client not installed. Responses will be stubbed."
-            if not os.getenv("OPENAI_API_KEY"):
-                return "Set OPENAI_API_KEY to enable OpenAI responses."
-            return "Connected to OpenAI API."
         if provider == "anthropic":
             if anthropic is None:
                 return "Anthropic client not installed. Responses will be stubbed."
-            if not os.getenv("ANTHROPIC_API_KEY"):
-                return "Set ANTHROPIC_API_KEY to enable Anthropic responses."
-            return "Connected to Anthropic API."
-        return f"Provider '{provider}' is not configured. Responses will be stubbed."
+        if provider == "gemini":
+            if self._optional_module("google.generativeai") is None:
+                return "Google Generative AI client not installed. Responses will be stubbed."
+        if provider == "cohere":
+            if self._optional_module("cohere") is None:
+                return "Cohere client not installed. Responses will be stubbed."
+        if not os.getenv(env_key):
+            return f"Set {env_key} to enable {provider_info['label']} responses."
+        return f"Connected to {provider_info['label']} API."
 
-    def _populate_model_selector(self) -> None:
-        self.model_selector.clear()
+    def _populate_provider_selector(self) -> None:
+        self.provider_selector.clear()
         preferences = self._memory.get("preferences", {})
         preferred_provider = None
-        preferred_model = None
         if isinstance(preferences, dict):
             preferred_provider = preferences.get("provider")
-            preferred_model = preferences.get("model")
+        providers = list(PROVIDER_REGISTRY.keys())
         selected_index = 0
-        for index, entry in enumerate(MODEL_REGISTRY):
-            self.model_selector.addItem(entry["display_name"], entry)
-            if (
-                entry["provider"] == preferred_provider
-                and entry["model_id"] == preferred_model
-            ):
+        for index, provider in enumerate(providers):
+            self.provider_selector.addItem(PROVIDER_REGISTRY[provider]["label"], provider)
+            if provider == preferred_provider:
+                selected_index = index
+        self.provider_selector.setCurrentIndex(selected_index)
+        self._populate_model_selector()
+        self._persist_model_selection()
+
+    def _populate_model_selector(self) -> None:
+        provider = self._selected_provider()
+        if not provider:
+            return
+        self.model_selector.blockSignals(True)
+        self.model_selector.clear()
+        models = PROVIDER_REGISTRY[provider]["models"]
+        preferences = self._memory.get("preferences", {})
+        model_map = {}
+        if isinstance(preferences, dict):
+            model_map = preferences.get("model_map", {}) or {}
+        preferred_model = model_map.get(provider)
+        selected_index = 0
+        for index, model in enumerate(models):
+            self.model_selector.addItem(model["display"], model["id"])
+            if model["id"] == preferred_model:
                 selected_index = index
         self.model_selector.setCurrentIndex(selected_index)
-        self._persist_model_selection(self._selected_model_info())
+        self.model_selector.blockSignals(False)
 
-    def _selected_model_info(self) -> dict[str, str]:
-        data = self.model_selector.currentData()
-        if isinstance(data, dict):
+    def _selected_provider(self) -> str | None:
+        data = self.provider_selector.currentData()
+        if isinstance(data, str):
             return data
-        return MODEL_REGISTRY[0]
+        return None
 
-    def _persist_model_selection(self, model_info: dict[str, str]) -> None:
+    def _selected_model_id(self) -> str:
+        data = self.model_selector.currentData()
+        if isinstance(data, str):
+            return data
+        provider = self._selected_provider()
+        if provider:
+            return PROVIDER_REGISTRY[provider]["models"][0]["id"]
+        return ""
+
+    def _persist_model_selection(self) -> None:
         preferences = self._memory.setdefault("preferences", {})
         if not isinstance(preferences, dict):
             preferences = {}
             self._memory["preferences"] = preferences
-        preferences["provider"] = model_info["provider"]
-        preferences["model"] = model_info["model_id"]
+        provider = self._selected_provider()
+        if provider:
+            preferences["provider"] = provider
+            model_map = preferences.get("model_map")
+            if not isinstance(model_map, dict):
+                model_map = {}
+            model_map[provider] = self._selected_model_id()
+            preferences["model_map"] = model_map
         self._save_memory()
         self._update_preferences_label()
 
+    def _handle_provider_change(self, *_: object) -> None:
+        self._populate_model_selector()
+        self._persist_model_selection()
+        self._maybe_prompt_api_key()
+        self.api_status.setText(self._api_status_text())
+
     def _handle_model_change(self, *_: object) -> None:
-        self._persist_model_selection(self._selected_model_info())
+        self._persist_model_selection()
         self.api_status.setText(self._api_status_text())
 
     def _load_history(self) -> None:
@@ -1124,7 +1224,7 @@ class ChatWindow(QtWidgets.QWidget):
     def _load_memory(self) -> dict[str, object]:
         memory_path = self._memory_path()
         if not memory_path.exists():
-            return {"preferences": {}, "task_outcomes": [], "failures": []}
+            return {"preferences": {}, "task_outcomes": [], "failures": [], "api_keys": {}}
         try:
             with memory_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
@@ -1132,9 +1232,10 @@ class ChatWindow(QtWidgets.QWidget):
                 "preferences": dict(payload.get("preferences", {})),
                 "task_outcomes": list(payload.get("task_outcomes", [])),
                 "failures": list(payload.get("failures", [])),
+                "api_keys": dict(payload.get("api_keys", {})),
             }
         except (OSError, ValueError, TypeError):
-            return {"preferences": {}, "task_outcomes": [], "failures": []}
+            return {"preferences": {}, "task_outcomes": [], "failures": [], "api_keys": {}}
 
     def _save_memory(self) -> None:
         memory_path = self._memory_path()
@@ -1142,14 +1243,60 @@ class ChatWindow(QtWidgets.QWidget):
         with memory_path.open("w", encoding="utf-8") as handle:
             json.dump(self._memory, handle, indent=2)
 
+    def _load_api_keys(self) -> None:
+        api_keys = self._memory.get("api_keys", {})
+        if not isinstance(api_keys, dict):
+            return
+        for provider, key in api_keys.items():
+            if provider in PROVIDER_REGISTRY and isinstance(key, str) and key:
+                env_key = PROVIDER_REGISTRY[provider]["env_key"]
+                if not os.getenv(env_key):
+                    os.environ[env_key] = key
+
+    def _maybe_prompt_api_key(self) -> None:
+        provider = self._selected_provider()
+        if not provider:
+            return
+        provider_info = PROVIDER_REGISTRY[provider]
+        env_key = provider_info["env_key"]
+        if os.getenv(env_key):
+            return
+        label = provider_info["label"]
+        prompt = f"Enter {label} API key ({env_key})"
+        key, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "API Key Required",
+            prompt,
+            QtWidgets.QLineEdit.Password,
+        )
+        if not ok:
+            return
+        key = key.strip()
+        if not key:
+            return
+        os.environ[env_key] = key
+        api_keys = self._memory.setdefault("api_keys", {})
+        if isinstance(api_keys, dict):
+            api_keys[provider] = key
+        self._save_memory()
+
+    def _optional_module(self, module_name: str):
+        if importlib.util.find_spec(module_name) is None:
+            return None
+        return importlib.import_module(module_name)
+
     def _summarize_preferences(self) -> str:
         preferences = self._memory.get("preferences", {})
         if not isinstance(preferences, dict) or not preferences:
             return "Preferences: none saved"
-        pairs = []
-        for key, value in preferences.items():
-            pairs.append(f"{key}={value}")
-        return "Preferences: " + ", ".join(pairs)
+        provider = preferences.get("provider")
+        model_map = preferences.get("model_map")
+        model = None
+        if isinstance(model_map, dict) and provider in model_map:
+            model = model_map.get(provider)
+        if provider and model:
+            return f"Preferences: provider={provider}, model={model}"
+        return f"Preferences: provider={provider or 'none'}"
 
     def _update_preferences_label(self) -> None:
         self.preferences_label.setText(self._summarize_preferences())
@@ -1356,16 +1503,28 @@ class ChatWindow(QtWidgets.QWidget):
         self.chat_view.scrollToBottom()
 
     def _generate_response(self) -> str:
-        model_info = self._selected_model_info()
-        provider = model_info["provider"]
-        model_id = model_info["model_id"]
-        if provider == "openai":
-            if openai is None or not os.getenv("OPENAI_API_KEY"):
+        provider = self._selected_provider()
+        if not provider:
+            return "Select a provider to start chatting."
+        model_id = self._selected_model_id()
+        provider_info = PROVIDER_REGISTRY[provider]
+        env_key = provider_info["env_key"]
+
+        if provider in {"openai", "deepseek", "groq", "mistral", "perplexity"}:
+            if openai is None:
                 return (
-                    "I'm ready to help. Install the OpenAI SDK and set OPENAI_API_KEY "
-                    "to enable live model responses."
+                    "I'm ready to help. Install the OpenAI SDK to enable "
+                    "live model responses."
                 )
-            client = openai.OpenAI()
+            self._maybe_prompt_api_key()
+            api_key = os.getenv(env_key)
+            if not api_key:
+                return f"Set {env_key} to enable {provider_info['label']} responses."
+            client_kwargs = {"api_key": api_key}
+            base_url = provider_info.get("base_url")
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = openai.OpenAI(**client_kwargs)
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -1374,13 +1533,17 @@ class ChatWindow(QtWidgets.QWidget):
                 return completion.choices[0].message.content
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
+
         if provider == "anthropic":
-            if anthropic is None or not os.getenv("ANTHROPIC_API_KEY"):
+            if anthropic is None:
                 return (
-                    "I'm ready to help. Install the Anthropic SDK and set "
-                    "ANTHROPIC_API_KEY to enable live model responses."
+                    "I'm ready to help. Install the Anthropic SDK to enable "
+                    "live model responses."
                 )
-            client = anthropic.Anthropic()
+            self._maybe_prompt_api_key()
+            if not os.getenv(env_key):
+                return f"Set {env_key} to enable {provider_info['label']} responses."
+            client = anthropic.Anthropic(api_key=os.getenv(env_key))
             try:
                 response = client.messages.create(
                     model=model_id,
@@ -1392,6 +1555,51 @@ class ChatWindow(QtWidgets.QWidget):
                 return "No response content returned from Anthropic."
             except Exception as exc:  # pragma: no cover - network call
                 return f"API error: {exc}"
+
+        if provider == "gemini":
+            self._maybe_prompt_api_key()
+            api_key = os.getenv(env_key)
+            if not api_key:
+                return f"Set {env_key} to enable {provider_info['label']} responses."
+            genai = self._optional_module("google.generativeai")
+            if genai is None:
+                return (
+                    "Install the Google Generative AI SDK (google-generativeai) "
+                    "to enable Gemini responses."
+                )
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_id)
+            prompt = "\n".join(
+                f"{msg['role']}: {msg['content']}"
+                for msg in self.chat_model.as_openai_messages()
+            )
+            try:
+                response = model.generate_content(prompt)
+                return response.text if response.text else "No response content returned from Gemini."
+            except Exception as exc:  # pragma: no cover - network call
+                return f"API error: {exc}"
+
+        if provider == "cohere":
+            self._maybe_prompt_api_key()
+            api_key = os.getenv(env_key)
+            if not api_key:
+                return f"Set {env_key} to enable {provider_info['label']} responses."
+            cohere = self._optional_module("cohere")
+            if cohere is None:
+                return (
+                    "Install the Cohere SDK (cohere) to enable Cohere responses."
+                )
+            client = cohere.Client(api_key)
+            prompt = "\n".join(
+                f"{msg['role']}: {msg['content']}"
+                for msg in self.chat_model.as_openai_messages()
+            )
+            try:
+                response = client.chat(model=model_id, message=prompt)
+                return response.text if response.text else "No response content returned from Cohere."
+            except Exception as exc:  # pragma: no cover - network call
+                return f"API error: {exc}"
+
         return f"No client available for provider '{provider}'."
 
 

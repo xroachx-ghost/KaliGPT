@@ -2441,12 +2441,12 @@ class ChatWindow(QtWidgets.QWidget):
         for attempt in range(max_retries + 1):
             try:
                 result = api_call()
-            except Exception as exc:  # pragma: no cover - network call
+            except Exception:  # pragma: no cover - network call
                 if attempt >= max_retries:
                     self._set_provider_health(
                         provider,
                         ProviderHealthState.ERROR,
-                        error_message=str(exc),
+                        error_message=self._friendly_api_status(provider),
                     )
                     raise
                 delay = base_delay * (2**attempt)
@@ -2454,7 +2454,7 @@ class ChatWindow(QtWidgets.QWidget):
                 self._set_provider_health(
                     provider,
                     ProviderHealthState.RETRYING,
-                    error_message=str(exc),
+                    error_message=self._friendly_retry_status(provider, delay),
                     retry_after_seconds=delay,
                 )
                 QtWidgets.QApplication.processEvents()
@@ -2463,6 +2463,14 @@ class ChatWindow(QtWidgets.QWidget):
             self._set_provider_health(provider, ProviderHealthState.OK)
             return result
         raise RuntimeError("Failed to obtain response after retries.")
+
+    def _friendly_retry_status(self, provider: str, delay: float) -> str:
+        label = PROVIDER_REGISTRY[provider]["label"]
+        return f"{label} API error. Retrying in {delay:.1f}s…"
+
+    def _friendly_api_status(self, provider: str) -> str:
+        label = PROVIDER_REGISTRY[provider]["label"]
+        return f"{label} API error. Please try again shortly."
 
     def _friendly_api_error(self, provider: str) -> str:
         label = PROVIDER_REGISTRY[provider]["label"]
@@ -2529,6 +2537,11 @@ class ChatWindow(QtWidgets.QWidget):
                 self._dispatch_actions(response)
                 return response
             except Exception:  # pragma: no cover - network call
+                self._set_provider_health(
+                    provider,
+                    ProviderHealthState.ERROR,
+                    error_message=self._friendly_api_status(provider),
+                )
                 return self._friendly_api_error(provider)
 
         if provider == "anthropic":
@@ -2560,6 +2573,11 @@ class ChatWindow(QtWidgets.QWidget):
                     return content
                 return "No response content returned from Anthropic."
             except Exception:  # pragma: no cover - network call
+                self._set_provider_health(
+                    provider,
+                    ProviderHealthState.ERROR,
+                    error_message=self._friendly_api_status(provider),
+                )
                 return self._friendly_api_error(provider)
 
         if provider == "gemini":
@@ -2588,6 +2606,11 @@ class ChatWindow(QtWidgets.QWidget):
                 self._dispatch_actions(content)
                 return content
             except Exception:  # pragma: no cover - network call
+                self._set_provider_health(
+                    provider,
+                    ProviderHealthState.ERROR,
+                    error_message=self._friendly_api_status(provider),
+                )
                 return self._friendly_api_error(provider)
 
         if provider == "cohere":
@@ -2614,6 +2637,11 @@ class ChatWindow(QtWidgets.QWidget):
                 self._dispatch_actions(content)
                 return content
             except Exception:  # pragma: no cover - network call
+                self._set_provider_health(
+                    provider,
+                    ProviderHealthState.ERROR,
+                    error_message=self._friendly_api_status(provider),
+                )
                 return self._friendly_api_error(provider)
 
         return f"No client available for provider '{provider}'."

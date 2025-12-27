@@ -492,6 +492,73 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         delay_widget = QtWidgets.QWidget()
         delay_widget.setLayout(delay_form)
 
+        self.manual_controls_group = QtWidgets.QGroupBox("Manual Actions")
+
+        self.mouse_x_spin = QtWidgets.QSpinBox()
+        self.mouse_x_spin.setRange(0, 10_000)
+        self.mouse_y_spin = QtWidgets.QSpinBox()
+        self.mouse_y_spin.setRange(0, 10_000)
+
+        coordinate_row = QtWidgets.QHBoxLayout()
+        coordinate_row.addWidget(QtWidgets.QLabel("X"))
+        coordinate_row.addWidget(self.mouse_x_spin)
+        coordinate_row.addSpacing(8)
+        coordinate_row.addWidget(QtWidgets.QLabel("Y"))
+        coordinate_row.addWidget(self.mouse_y_spin)
+        coordinate_row.addStretch()
+
+        self.move_mouse_button = QtWidgets.QPushButton("Move Mouse")
+        self.move_mouse_button.clicked.connect(self.handle_move_mouse)
+
+        self.click_button_combo = QtWidgets.QComboBox()
+        self.click_button_combo.addItem("Left", "left")
+        self.click_button_combo.addItem("Right", "right")
+        self.click_button_combo.addItem("Middle", "middle")
+
+        self.click_count_spin = QtWidgets.QSpinBox()
+        self.click_count_spin.setRange(1, 10)
+        self.click_count_spin.setValue(1)
+
+        click_row = QtWidgets.QHBoxLayout()
+        click_row.addWidget(self.click_button_combo)
+        click_row.addWidget(QtWidgets.QLabel("Clicks"))
+        click_row.addWidget(self.click_count_spin)
+        click_row.addStretch()
+
+        self.click_mouse_button = QtWidgets.QPushButton("Click Mouse")
+        self.click_mouse_button.clicked.connect(self.handle_click_mouse)
+
+        self.type_text_input = QtWidgets.QPlainTextEdit()
+        self.type_text_input.setPlaceholderText("Enter text to type")
+        self.type_text_input.setFixedHeight(70)
+
+        self.type_text_button = QtWidgets.QPushButton("Type Text")
+        self.type_text_button.clicked.connect(self.handle_type_text)
+
+        self.key_input = QtWidgets.QLineEdit()
+        self.key_input.setPlaceholderText("e.g., enter, esc, ctrl")
+
+        self.press_key_button = QtWidgets.QPushButton("Press Key")
+        self.press_key_button.clicked.connect(self.handle_press_key)
+
+        key_row = QtWidgets.QHBoxLayout()
+        key_row.addWidget(self.key_input)
+        key_row.addWidget(self.press_key_button)
+
+        manual_layout = QtWidgets.QGridLayout(self.manual_controls_group)
+        manual_layout.setColumnStretch(1, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("Move to"), 0, 0)
+        manual_layout.addLayout(coordinate_row, 0, 1)
+        manual_layout.addWidget(self.move_mouse_button, 1, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("Click"), 2, 0)
+        manual_layout.addLayout(click_row, 2, 1)
+        manual_layout.addWidget(self.click_mouse_button, 3, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("Type text"), 4, 0)
+        manual_layout.addWidget(self.type_text_input, 4, 1)
+        manual_layout.addWidget(self.type_text_button, 5, 1)
+        manual_layout.addWidget(QtWidgets.QLabel("Press key"), 6, 0)
+        manual_layout.addLayout(key_row, 6, 1)
+
         self.activity_log = QtWidgets.QPlainTextEdit()
         self.activity_log.setReadOnly(True)
         self.activity_log.setPlaceholderText("Automation log will appear here.")
@@ -507,6 +574,7 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.take_screenshot_button)
         layout.addWidget(self.preview_toggle_button)
         layout.addWidget(delay_widget)
+        layout.addWidget(self.manual_controls_group)
         layout.addWidget(self.activity_log)
         self.screenshot_captured.connect(self.update_preview)
 
@@ -658,6 +726,24 @@ class ComputerControlPanel(QtWidgets.QGroupBox):
         delay = self._action_delay_seconds()
         if delay > 0:
             time.sleep(delay)
+
+    def handle_move_mouse(self) -> None:
+        self.move_mouse(self.mouse_x_spin.value(), self.mouse_y_spin.value())
+
+    def handle_click_mouse(self) -> None:
+        button_data = self.click_button_combo.currentData()
+        button = button_data if isinstance(button_data, str) else "left"
+        self.click_mouse(button=button, clicks=self.click_count_spin.value(), interval=0.0)
+
+    def handle_type_text(self) -> None:
+        self.type_text(self.type_text_input.toPlainText())
+
+    def handle_press_key(self) -> None:
+        key = self.key_input.text().strip()
+        if not key:
+            self.log("Key press skipped: no key provided.")
+            return
+        self.press_key(key)
 
     def move_mouse(self, x: int, y: int, duration: Optional[float] = None) -> bool:
         if not self._control_allowed("Move mouse"):
